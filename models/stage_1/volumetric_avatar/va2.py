@@ -15,7 +15,162 @@ from torch import nn
 import torch.nn.functional as F
 from dataclasses import dataclass
 import math
-from networks.volumetric_avatar.utils import ResBlock,norm_layers,activations
+from networks.volumetric_avatar.utils import replace_bn_to_bcn,replace_bn_to_gn,replace_bn_to_in,ResBlock,norm_layers,activations
+
+
+from dataclasses import dataclass
+from typing import List, Tuple, Union
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision import models
+
+
+
+
+@dataclass
+class IdtEmbedConfig:
+    """Configuration for Identity Embedding Network.
+
+    Attributes:
+        idt_backbone: Name of the backbone architecture (e.g., 'resnet18')
+        num_source_frames: Number of source images per identity
+        idt_output_size: Size of the output feature map
+        idt_output_channels: Number of output channels
+        num_gpus: Number of GPUs to use
+        norm_layer_type: Type of normalization layer ('bn', 'in', 'gn', 'bcn')
+        idt_image_size: Input image size
+    """
+    idt_backbone: str ="resnet50"
+    num_source_frames: int=1
+    idt_output_size: int=8
+    idt_output_channels: int=512
+    num_gpus: int=1
+    norm_layer_type: str="gn"
+    idt_image_size: int=256
+
+
+class IdtEmbed(nn.Module):
+    """Identity Embedding Network.
+    
+    This module processes source images to create identity embeddings using a backbone
+    CNN architecture with customizable normalization layers.
+    """
+
+    def __init__(self, cfg: IdtEmbedConfig):
+        """Initialize the Identity Embedding network.
+
+        Args:
+            cfg: Configuration object containing network parameters
+        """
+        super().__init__()
+        self.cfg = cfg
+        self._setup_network()
+        self._register_normalization_values()
+
+    def _setup_network(self) -> None:
+        """Set up the network architecture including backbone and custom layers."""
+        expansion = self._get_expansion_factor()
+        self.net = self._create_backbone()
+        self.net.avgpool = nn.AdaptiveAvgPool2d(self.cfg.idt_output_size)
+        self.net.fc = nn.Conv2d(
+            in_channels=512 * expansion,
+            out_channels=self.cfg.idt_output_channels,
+            kernel_size=1,
+            bias=False
+        )
+        self._setup_normalization_layers()
+
+    def _get_expansion_factor(self) -> int:
+        """Determine the expansion factor based on backbone architecture."""
+        return 1 if self.cfg.idt_backbone == 'resnet18' else 4
+
+    def _create_backbone(self) -> nn.Module:
+        """Create the backbone network."""
+        return getattr(models, self.cfg.idt_backbone)(pretrained=True)
+
+    def _setup_normalization_layers(self) -> None:
+        """Set up normalization layers based on configuration."""
+        norm_types = {
+            'in': (replace_bn_to_in, 'Instance Normalization'),
+            'gn': (replace_bn_to_gn, 'Group Normalization'),
+            'bcn': (replace_bn_to_bcn, 'Batch-Channel Normalization'),
+        }
+
+        if self.cfg.norm_layer_type == 'bn':
+            return
+        
+        if self.cfg.norm_layer_type not in norm_types:
+            raise ValueError(f"Unsupported normalization type: {self.cfg.norm_layer_type}")
+        
+        replace_fn, norm_name = norm_types[self.cfg.norm_layer_type]
+        self.net = replace_fn(self.net, 'IdtEmbed')
+
+    def _register_normalization_values(self) -> None:
+        """Register normalization values as buffers."""
+        self.register_buffer('mean', 
+            torch.FloatTensor([0.485, 0.456, 0.406])[None, :, None, None])
+        self.register_buffer('std', 
+            torch.FloatTensor([0.229, 0.224, 0.225])[None, :, None, None])
+
+    def _forward_impl(self, x: torch.Tensor) -> torch.Tensor:
+        """Implementation of the forward pass through the network.
+
+        Args:
+            x: Input tensor
+
+        Returns:
+            Processed tensor after passing through all network layers
+        """
+        x = self.net.conv1(x)
+        x = self.net.bn1(x)
+        x = self.net.relu(x)
+        x = self.net.maxpool(x)
+
+        x = self.net.layer1(x)
+        x = self.net.layer2(x)
+        x = self.net.layer3(x)
+        x = self.net.layer4(x)
+
+        x = self.net.fc(x)
+        x = self.net.avgpool(x)
+        return x
+
+    def forward_image(self, source_img: torch.Tensor) -> torch.Tensor:
+        """Process source images to create identity embeddings.
+
+        Args:
+            source_img: Input source images tensor of shape (B*N, C, H, W)
+                where N is num_source_frames
+
+        Returns:
+            Identity embedding tensor
+        """
+        source_img = F.interpolate(
+            source_img, 
+            size=(self.cfg.idt_image_size, self.cfg.idt_image_size), 
+            mode='bilinear'
+        )
+        n = self.cfg.num_source_frames
+        b = source_img.shape[0] // n
+
+        inputs = (source_img - self.mean) / self.std
+        idt_embed_tensor = self._forward_impl(inputs)
+        return idt_embed_tensor.view(b, n, *idt_embed_tensor.shape[1:]).mean(1)
+
+    def forward(self, source_img: torch.Tensor) -> torch.Tensor:
+        """Forward pass of the network.
+
+        Args:
+            source_img: Input source images tensor
+
+        Returns:
+            Identity embedding tensor
+        """
+        return self.forward_image(source_img)
+
+
 @dataclass(frozen=True)
 class LocalEncoderConfig:
     """Hardcoded configuration for LocalEncoder."""
@@ -392,36 +547,32 @@ class Model(nn.Module):
 
         # Initialize face parsing if needed
         if self.config.use_mix_mask:
-            self.face_parsing = volumetric_avatar.FaceParsing(
-                None, 
-                device=self.config.device
-            )
+            self.face_parsing = volumetric_avatar.FaceParsing()
             
+        @dataclass
+        class Config:
+            z_dim: int = 16,  # Input latent (Z) dimensionality.
+            c_dim: int = 96,  # Conditioning label (C) dimensionality.
+            w_dim: int = 64,  # Intermediate latent (W) dimensionality.
+            img_resolution: int = 64,  # Output resolution.
+            dec_channels: int = 1024,  # Number of output color channels
+            img_channels: int = 384,  # Number of output color channels
+            features_sigm: int  = 1,
+            squeeze_dim: int = 0,
+            depth_resolution: int = 48,
+            hidden_vol_dec_dim: int = 448,
+            num_layers_vol_dec: int  = 2
+
+        cfg = Config()
         # Volume renderer
-        if self.config.volume_rendering:
-            self.volume_renderer = volumetric_avatar.VolumeRenderer(
-                dec_channels=1024,
-                img_channels=self.config.dec_max_channels,
-                squeeze_dim=0,
-                features_sigm=1,
-                depth_resolution=48,
-                hidden_vol_dec_dim=448,
-                num_layers_vol_dec=2
-            )
-        else:
-            self.volume_renderer = nn.Linear(1, 1)
+        self.volume_renderer = volumetric_avatar.VolumeRenderer(
+            cfg
+        )
+
             
         # Identity and Expression Embedders
-        self.idt_embedder = volumetric_avatar.IdtEmbed(
-            idt_backbone="resnet50",
-            use_amp_autocast=False, 
-            num_source_frames=1,
-            idt_output_size=self.config.gen_dummy_input_size,
-            idt_output_channels=512,
-            num_gpus=self.config.num_gpus,
-            norm_layer_type=self.config.norm_layer_type,
-            idt_image_size=256
-        )
+        idtCfg = IdtEmbedConfig()
+        self.idt_embedder = IdtEmbed(idtCfg)
 
         # Expression Embedder 
         self.expression_embedder = volumetric_avatar.ExpressionEmbed(
