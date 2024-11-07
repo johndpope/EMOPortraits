@@ -550,68 +550,47 @@ class Model(nn.Module):
             self.face_parsing = volumetric_avatar.FaceParsing()
             
         @dataclass
-        class Config:
-            z_dim: int = 16,  # Input latent (Z) dimensionality.
-            c_dim: int = 96,  # Conditioning label (C) dimensionality.
-            w_dim: int = 64,  # Intermediate latent (W) dimensionality.
-            img_resolution: int = 64,  # Output resolution.
-            dec_channels: int = 1024,  # Number of output color channels
-            img_channels: int = 384,  # Number of output color channels
-            features_sigm: int  = 1,
-            squeeze_dim: int = 0,
-            depth_resolution: int = 48,
-            hidden_vol_dec_dim: int = 448,
+        class volConfig:
+            z_dim: int = 16  # Input latent (Z) dimensionality.
+            c_dim: int = 96  # Conditioning label (C) dimensionality.
+            w_dim: int = 64  # Intermediate latent (W) dimensionality.
+            img_resolution: int = 64  # Output resolution.
+            dec_channels: int = 1024  # Number of output color channels
+            img_channels: int = 384  # Number of output color channels
+            features_sigm: int  = 1
+            squeeze_dim: int =0 
+            depth_resolution: int = 48
+            hidden_vol_dec_dim: int = 448
             num_layers_vol_dec: int  = 2
 
-        cfg = Config()
+        cfg = volConfig()
         # Volume renderer
-        self.volume_renderer = volumetric_avatar.VolumeRenderer(
-            cfg
-        )
+        print("cfg:",cfg.squeeze_dim)
+        self.volume_renderer = volumetric_avatar.VolumeRenderer(cfg)
 
             
         # Identity and Expression Embedders
         idtCfg = IdtEmbedConfig()
         self.idt_embedder = IdtEmbed(idtCfg)
 
-        # Expression Embedder 
-        self.expression_embedder = volumetric_avatar.ExpressionEmbed(
-            use_amp_autocast=False,
-            lpe_head_backbone=self.config.lpe_face_backbone,
-            lpe_face_backbone="resnet18",
-            image_size=256,
+
+      # OR using configuration with head network
+        expr_cfg_with_head = volumetric_avatar.ExpressionEmbed.create_default(
+            project_dir=self.config.project_dir,
             num_gpus=self.config.num_gpus,
-            lpe_output_channels=128,
-            lpe_final_pooling_type="avg",
-            lpe_output_size=4,
-            norm_layer_type=self.config.norm_layer_type
+            norm_layer_type=self.config.norm_layer_type,
+            use_smart_scale=True
         )
+        
+        # Initialize expression embedder with chosen configuration
+        self.expression_embedder = volumetric_avatar.ExpressionEmbed(expr_cfg_with_head)
+
 
         # Warp generators
-        warp_gen_config = {
-            "eps": 1e-8,
-            "num_gpus": self.config.num_gpus,
-            "use_amp_autocast": False,
-            "gen_adaptive_conv_type": "sum",
-            "gen_activation_type": "relu", 
-            "gen_upsampling_type": "trilinear",
-            "gen_downsampling_type": "avgpool",
-            "gen_max_channels": self.config.dec_max_channels,
-            "gen_num_channels": 32,
-            "warp_channel_mult": 1.0,
-            "warp_block_type": "res",
-            "norm_layer_type": self.config.norm_layer_type
-        }
-        
-        self.xy_generator = volumetric_avatar.WarpGenerator(
-            **warp_gen_config, 
-            input_channels=self.config.dec_max_channels
-        )
-        
-        self.uv_generator = volumetric_avatar.WarpGenerator(
-            **warp_gen_config,
-            input_channels=self.config.dec_max_channels 
-        )
+        warp_gen_config = volumetric_avatar.WarpGenerator.create_default()
+        warp_gen_config.input_channels=self.config.dec_max_channels
+        self.xy_generator = volumetric_avatar.WarpGenerator(warp_gen_config)
+        self.uv_generator = volumetric_avatar.WarpGenerator(warp_gen_config)
 
         # Initialize discriminators for training
         if training:
