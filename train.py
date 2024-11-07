@@ -7,31 +7,21 @@ import pathlib
 import importlib
 import ssl
 import time
-import sys
 from tqdm import tqdm
-import functools
 from PIL import Image
 from utils import args as args_utils
 from utils.logger_wandb import Logger
 import warnings
-warnings.filterwarnings("ignore")
+
 from torchvision import transforms
-import wandb
-import os
+
 
 os.environ["WANDB_SILENT"] = "True"
-
-import os
-import sys
-import tempfile
-import torch
-import torch.distributed as dist
-import torch.nn as nn
-import torch.optim as optim
-import torch.multiprocessing as mp
+warnings.filterwarnings("ignore")
 
 
-# 
+
+# from torch.nn.parallel import DistributedDataParallel as DDP
 
 
 
@@ -40,11 +30,8 @@ class Trainer(object):
         super(Trainer, self).__init__()
         # Initialize and apply general options
 
-        if args.use_torch_ddp:
-            from torch.nn.parallel import DistributedDataParallel as DDP
-        else:
-            import apex
-            from apex import amp
+
+        
 
 
         ssl._create_default_https_context = ssl._create_unverified_context
@@ -475,7 +462,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(conflict_handler='resolve')
 
-    parser.add_argument('--project_dir', default='/fsx/nikitadrobyshev/EmoPortraits', type=str)
+    parser.add_argument('--project_dir', default='/media/oem/12TB/EMOPortraits', type=str)
     parser.add_argument('--experiment_name', default='', type=str)
     parser.add_argument('--dataset_name', default='voxceleb2hq_pairs', type=str)
     parser.add_argument('--dataset_name_test', default='voxceleb2hq_pairs', type=str)

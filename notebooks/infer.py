@@ -68,7 +68,7 @@ class InferenceWrapper(nn.Module):
         self.debug = debug
         self.num_gpus = num_gpus
 
-        self.modnet_pass = '/fsx/nikitadrobyshev/megaportraits_orig/repos/MODNet/pretrained/modnet_photographic_portrait_matting.ckpt'
+        self.modnet_pass = '/media/oem/12TB/EMOPortraits/repos/MODNet/pretrained/modnet_photographic_portrait_matting.ckpt'
 
         # Get a config for the network
         args_path = pathlib.Path(project_dir) / folder / experiment_name / 'args.txt' if args_path is None else args_path

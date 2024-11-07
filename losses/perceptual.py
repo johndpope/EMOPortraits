@@ -507,7 +507,7 @@ def _bisenet_FP(layers):
     r"""Get vgg face layers"""
     n_classes = 19
     network = BiSeNet(n_classes=n_classes)
-    project_dir = '/fsx/nikitadrobyshev/EmoPortraits'
+    project_dir = '/media/oem/12TB/EMOPortraits'
     path_to_face_parsing = f'{project_dir}/repos/face_par_off'
     state_dict_p = os.path.join(f'{path_to_face_parsing}/res/cp/79999_iter.pth')
     network.load_state_dict(torch.load(state_dict_p, map_location='cpu'))
@@ -533,7 +533,7 @@ def _bisenet_FP(layers):
 def _face_resnet(layers):
     r"""Get vgg face layers"""
     network = senet50_ft_dag(
-        weights_path='/fsx/nikitadrobyshev/EmoPortraits/losses/loss_model_weights/senet50_ft_dag.pth')
+        weights_path='/media/oem/12TB/EMOPortraits/losses/loss_model_weights/senet50_ft_dag.pth')
     network.eval()
 
     # c = list(network.children())

@@ -1,0 +1,9 @@
+
+For_EmoPortraits/*
+node_modules/*
+repos/*
+logs/*
+logs_s2/*
+
+losses/gaze_models/*
+losses/loss_model_weights/*

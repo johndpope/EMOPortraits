@@ -5,7 +5,9 @@ from argparse import ArgumentParser
 import numpy as np
 import itertools
 from torch.cuda import amp
-# sys.path.append('/fsx/nikitadrobyshev/')
+import os
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from networks import basic_avatar, volumetric_avatar
 from utils import args as args_utils
 from utils import spectral_norm, weight_init, point_transforms

@@ -378,7 +378,7 @@ class ResNetWrapper(nn.Module):
 
         if self.custom_w:
             self.net = ResNet18()
-            checkpoint = torch.load('/fsx/nikitadrobyshev/EmoPortraits/repos/official/Resnet18/checkpoints/best_checkpoint.tar')
+            checkpoint = torch.load('/media/oem/12TB/EMOPortraits/repos/official/Resnet18/checkpoints/best_checkpoint.tar')
             self.net.load_state_dict(checkpoint['model_state_dict'], strict=False)
             print('custom weights expression')
             

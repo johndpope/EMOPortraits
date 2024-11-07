@@ -15,7 +15,7 @@ from utils import spectral_norm, stats_calc
 from datasets.voxceleb2hq_pairs import LMDBDataset
 from repos.MODNet.src.models.modnet import MODNet
 import sys
-sys.path.append('/fsx/nikitadrobyshev/EmoPortraits')
+sys.path.append('/media/oem/12TB/EMOPortraits')
 from networks.volumetric_avatar import FaceParsing
 from torch.nn.modules.module import _addindent
 import mediapipe as mp

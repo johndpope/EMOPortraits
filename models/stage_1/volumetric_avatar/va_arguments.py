@@ -1,8 +1,9 @@
 from argparse import ArgumentParser
 from utils import args as args_utils
 import sys
-sys.path.append('/fsx/nikitadrobyshev/')
-from EmoPortraits.networks import basic_avatar, volumetric_avatar
+sys.path.append('/media/oem/12TB/')
+
+from EMOPortraits.networks import basic_avatar, volumetric_avatar
 from dataclasses import dataclass
 from copy import deepcopy
 
@@ -23,7 +24,7 @@ class VolumetricAvatarConfig:
 
         parser.add_argument('--estimate_head_pose_from_keypoints', default='True', type=args_utils.str2bool,
                             choices=[True, False])
-        parser.add_argument('--head_pose_regressor_path', default='/fsx/nikitadrobyshev/EmoPortraits/repos/head_pose_regressor.pth')
+        parser.add_argument('--head_pose_regressor_path', default='/media/oem/12TB/EMOPortraits/repos/head_pose_regressor.pth')
         parser.add_argument('--additive_motion', default='False', type=args_utils.str2bool, choices=[True, False])
 
         parser.add_argument('--use_seg', default='True', type=args_utils.str2bool, choices=[True, False])

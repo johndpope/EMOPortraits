@@ -10,7 +10,7 @@ class FaceParsing(object):
     def __init__(self,
                  mask_type,
                  device="cuda",
-                 project_dir = '/fsx/nikitadrobyshev/EmoPortraits',):
+                 project_dir = '/media/oem/12TB/EMOPortraits',):
         super(FaceParsing, self).__init__()
 
 
