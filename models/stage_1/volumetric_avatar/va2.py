@@ -473,35 +473,39 @@ class Model(nn.Module):
         self.exp_dir = exp_dir
         self.rank = rank
         
-        # Basic parameters
-        self.num_source_frames = 1  # No support for multiple sources
+        # Initialize basic parameters
+        self.num_source_frames = 1  # Single source frame support
         self.background_net_input_channels = 64
-        self.embed_size = 8
-        
-        # Model settings
+        self.embed_size = 4
+
+        # Initialize model flags
         self.pred_seg = False
         self.use_stylegan_d = False
         self.pred_flip = False
         self.pred_mixing = True
         self.pred_cycle = True
         
-        # Initialize components
-        self.setup_preprocessing()
-        self.init_networks(training)
-        if training:
-            self.init_losses()
-            
-        # Register coordinate grids
-        self.register_coordinate_grids()
+        # Initialize preprocessing and networks
+        self._setup_preprocessing()
+        self._init_networks(training)
         
-        # Initialize training state
+        # Initialize training components if needed
+        if training:
+            self._init_discriminators()
+            self._init_losses()
+            
+        # Register coordinate grids for warping
+        self._register_coordinate_grids()
+        
+        # Initialize state tracking
         self.prev_targets = None
         self.thetas_pool = []
         
-        # Apply initializations
-        self.apply(weight_init.weight_init(init_type='kaiming', init_gain=0.02))
+        # Apply weight initialization
+        self.apply(self._weight_init)
+
         
-    def setup_preprocessing(self):
+    def _setup_preprocessing(self):
         """Setup preprocessing functions"""
         self.resize_d = lambda img: F.interpolate(
             img, 
@@ -539,7 +543,7 @@ class Model(nn.Module):
             persistent=False
         )
 
-    def init_networks(self, training: bool = True):
+    def _init_networks(self, training: bool = True):
         """Initialize all network components"""
         # Encoders
 
@@ -592,33 +596,122 @@ class Model(nn.Module):
         self.xy_generator = volumetric_avatar.WarpGenerator(warp_gen_config)
         self.uv_generator = volumetric_avatar.WarpGenerator(warp_gen_config)
 
-        # Initialize discriminators for training
-        if training:
-            self.init_discriminators()
-
-    def init_discriminators(self):
-        """Initialize discriminator networks"""
-        self.discriminator = basic_avatar.MultiScaleDiscriminator(
-            min_channels=64,
-            max_channels=512, 
-            num_blocks=4,
-            input_channels=3,
-            input_size=self.config.image_size,
-            num_scales=2
+        # Initialize 3D processing networks
+        self.volume_process = volumetric_avatar.Unet3D(
+            in_channels=self.config.volume_channels,
+            out_channels=self.config.volume_channels,
+            num_blocks=self.config.volume_blocks,
+            base_channels=self.config.volume_channels
         )
-        
-        if self.config.use_stylegan_d:
-            self.stylegan_discriminator = basic_avatar.DiscriminatorStyleGAN2(
-                size=self.config.image_size,
-                channel_multiplier=1,
-                my_ch=2
+
+        # Initialize decoder
+        self.decoder = volumetric_avatar.Decoder(
+            in_channels=self.config.volume_channels * self.config.volume_depth,
+            out_channels=3,
+            num_channels=self.config.decoder_channels,
+            max_channels=self.config.decoder_max_channels,
+            num_blocks=self.config.decoder_blocks,
+            predict_segmentation=self.config.decoder_predict_segmentation
+        )
+
+    
+    def _init_discriminators(self):
+        """Initialize discriminator networks for training."""
+        if not hasattr(self, 'discriminator'):
+            self.discriminator = basic_avatar.MultiScaleDiscriminator(
+                input_channels=3,
+                num_channels=self.config.discriminator_channels,
+                max_channels=self.config.discriminator_max_channels,
+                num_blocks=self.config.discriminator_blocks,
+                num_scales=self.config.discriminator_scales
             )
+            
+        if self.use_stylegan_d:
+            self.style_discriminator = basic_avatar.DiscriminatorStyleGAN2(
+                size=self.config.image_size,
+                channel_multiplier=1
+            )
+
+    def _register_coordinate_grids(self):
+        """Register 2D and 3D coordinate grids as model buffers."""
+        # 2D identity grid
+        grid_s = torch.linspace(-1, 1, self.config.volume_size)
+        v, u = torch.meshgrid(grid_s, grid_s)
+        self.register_buffer(
+            'identity_grid_2d',
+            torch.stack([u, v], dim=2).view(1, -1, 2),
+            persistent=False
+        )
+
+        # 3D identity grid
+        grid_s = torch.linspace(-1, 1, self.config.volume_size)
+        grid_z = torch.linspace(-1, 1, self.config.volume_depth)
+        w, v, u = torch.meshgrid(grid_z, grid_s, grid_s)
+        e = torch.ones_like(u)
+        self.register_buffer(
+            'identity_grid_3d',
+            torch.stack([u, v, w, e], dim=3).view(1, -1, 4),
+            persistent=False
+        )
+
+    def _weight_init(self, m):
+        """Initialize network weights."""
+        if isinstance(m, (nn.Conv2d, nn.Conv3d, nn.Linear)):
+            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, (nn.BatchNorm2d, nn.BatchNorm3d)):
+            nn.init.constant_(m.weight, 1)
+            nn.init.constant_(m.bias, 0)
+
 
     def init_losses(self):
         """Initialize loss functions"""
-        if self.config.pred_seg:
-            self.seg_loss = nn.BCELoss()
-            
         self.init_additional_losses()
 
- 
+    def forward(self, data_dict: dict, phase: str = 'train', optimizer_idx: int = 0, 
+                visualize: bool = False, iteration: int = 0):
+        """Forward pass through the model.
+        
+        Args:
+            data_dict: Dictionary containing input data
+            phase: Current phase ('train' or 'test')
+            optimizer_idx: Index of current optimizer
+            visualize: Whether to generate visualizations
+            iteration: Current training iteration
+            
+        Returns:
+            Tuple containing (loss, loss_dict, visuals, updated_data_dict)
+        """
+        mode = ['gen', 'dis', 'dis_stylegan'][optimizer_idx]
+        
+        if mode == 'gen':
+            # Prepare input data
+            data_dict = self.prepare_input_data(data_dict)
+            
+            # Run generator forward pass
+            data_dict = self.G_forward(data_dict, visualize, iteration)
+            
+            if phase == 'train':
+                # Calculate generator losses
+                loss, losses_dict = self._calculate_generator_losses(data_dict)
+            else:
+                # Calculate test metrics
+                loss = None
+                losses_dict = self._calculate_test_metrics(data_dict)
+                
+        elif mode == 'dis':
+            # Run discriminator forward pass and calculate losses
+            loss, losses_dict = self._discriminator_forward(data_dict)
+            
+        elif mode == 'dis_stylegan':
+            # Run StyleGAN discriminator forward pass if enabled
+            if self.use_stylegan_d:
+                loss, losses_dict = self._stylegan_discriminator_forward(data_dict, iteration)
+            else:
+                loss, losses_dict = None, {}
+                
+        # Generate visualizations if requested
+        visuals = self.get_visuals(data_dict) if visualize else None
+            
+        return loss, losses_dict, visuals, data_dict

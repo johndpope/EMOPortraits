@@ -4,6 +4,7 @@ from .head_pose_matching import HeadPoseMatchingLoss
 from .perceptual import PerceptualLoss
 from .segmentation import SegmentationLoss
 from .equivariance import EquivarianceLoss
+from .warping_regularizer import WarpReg
 
 from .psnr import PSNR
 from .lpips import LPIPS
