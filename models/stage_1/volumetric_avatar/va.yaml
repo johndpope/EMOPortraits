@@ -276,3 +276,45 @@ adversarial_weight:  1.0
 # gaze_weight: 10.0
 
 
+amp_opt_level: 'O0'
+augment_color_train: True
+coarse_num_sample: 48
+d_reg_every: 16
+data_root: '/fsx/VC2_HD_f'
+dataset_name_mead: 'mead_faces_pairs'
+dataset_name_sec: 'extrime_faces_pairs'
+dataset_name_test_mead: 'mead_faces_pairs'
+dataset_name_test_sec: 'extrime_faces_pairs'
+entity: 'animator'
+freeze_proc_nw: -1.0
+gray_source_prob: 0.0
+hidden_vol_dec_dim: 448
+image_additional_size_d: 'None'
+latest_checkpoint_freq: 1
+local_rank: 'None'
+log_wandb: True
+match_neutral: False
+mead_as_second_every: 0
+model_name: 'va'
+model_type: 'volumetric_avatar'
+num_layers_vol_dec: 2
+num_workers: 16
+output_aug_warp: True
+output_aug_warp_out: True
+output_visuals: True
+project_name: 'main_gig'
+rand_crop_prob: 0.0
+rand_crop_scale: 0.9
+rand_shift_prob: 0.0
+rot_aug_angle: 0.0
+scale_cond_tr: 0.8
+shift_limit: 0.1
+squeeze_dim: 0
+start_vol_rgb: 0
+targ_vol_loss_scale: 0.0
+test_freq: 1
+trainer_checkpoint: 'None'
+use_diverse: True
+use_hq: True
+use_torch_ddp: False
+warp_aug_color_coef: 1.0
