@@ -30,7 +30,7 @@ import cv2
 import PIL
 from typing import Dict, Optional, Tuple, List
 from omegaconf import OmegaConf
-
+import time 
 
 to_tensor = transforms.ToTensor()
 to_image = transforms.ToPILImage()
@@ -746,9 +746,9 @@ class InferenceWrapper(nn.Module):
         return torch.from_numpy(pred_mixing_theta)[:, :3].type(source_theta.type()).to(source_theta.device)
 
     def process_video(self, 
-                    source_img: PIL.Image.Image,
-                    video_path: str,
-                    max_frames: Optional[int] = None) -> Tuple[List[PIL.Image.Image], List[PIL.Image.Image]]:
+                source_img: PIL.Image.Image,
+                video_path: str,
+                max_frames: Optional[int] = None) -> Tuple[List[PIL.Image.Image], List[PIL.Image.Image]]:
         """Process video frames using source image.
         
         Args:
@@ -759,24 +759,27 @@ class InferenceWrapper(nn.Module):
         Returns:
             Tuple of (generated frames, driving frames)
         """
+        import time
+        
         # Get video frames
         cap = cv2.VideoCapture(video_path)
         driving_frames = []
         
-        # Read frames up to max_frames if specified
         while True:
             ret, frame = cap.read()
             if not ret or (max_frames and len(driving_frames) >= max_frames):
                 break
                 
-            # Convert BGR to RGB
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             frame_pil = to_512(Image.fromarray(frame_rgb))
             driving_frames.append(frame_pil)
             
         cap.release()
         
+        print(f"Total frames to process: {len(driving_frames)}")
+        
         # Process first frame to initialize source
+        start_time = time.time()
         results = self.forward(
             source_image=source_img,
             driver_image=driving_frames[0],
@@ -792,8 +795,12 @@ class InferenceWrapper(nn.Module):
         if results:
             generated_frames.append(results[0][0])
         
-        # Process remaining frames
-        for frame in driving_frames[1:]:
+        # Process remaining frames with FPS tracking
+        frame_times = []
+        
+        for i, frame in enumerate(driving_frames[1:], 1):
+            frame_start = time.time()
+            
             results = self.forward(
                 source_image=None,  # Source already processed
                 driver_image=frame,
@@ -804,11 +811,32 @@ class InferenceWrapper(nn.Module):
                 mix_old=False,
                 modnet_mask=False
             )
+            
             if results:
                 generated_frames.append(results[0][0])
-                
+            
+            frame_end = time.time()
+            frame_time = frame_end - frame_start
+            frame_times.append(frame_time)
+            
+            # Calculate and display running statistics
+            if i % 10 == 0:  # Update every 10 frames
+                avg_fps = 1.0 / (sum(frame_times) / len(frame_times))
+                eta = (len(driving_frames) - i) * (sum(frame_times) / len(frame_times))
+                print(f"Processed {i}/{len(driving_frames)} frames | "
+                    f"Average FPS: {avg_fps:.2f} | "
+                    f"ETA: {eta:.2f}s")
+        
+        # Final statistics
+        total_time = time.time() - start_time
+        avg_fps = len(driving_frames) / total_time
+        print(f"\nGeneration complete:")
+        print(f"Total frames: {len(driving_frames)}")
+        print(f"Total time: {total_time:.2f}s")
+        print(f"Average FPS: {avg_fps:.2f}")
+        print(f"Average time per frame: {1000 * total_time / len(driving_frames):.2f}ms")
+        
         return generated_frames, driving_frames
-
     def save_video(self,
             source_img: PIL.Image.Image,
             generated_frames: List[PIL.Image.Image], 
