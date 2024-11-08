@@ -43,7 +43,7 @@ class Model(nn.Module):
         super(Model, self).__init__()
         self.cfg = OmegaConf.load('./models/stage_1/volumetric_avatar/va.yaml')
         cfg = self.cfg
-        print("👹 args:",cfg.gen_embed_size)
+        print("👹 args:",cfg)
 
         print("OLD args:",DELETE)
         self.exp_dir = exp_dir
