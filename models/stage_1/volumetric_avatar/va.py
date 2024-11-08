@@ -44,6 +44,8 @@ class Model(nn.Module):
         self.cfg = OmegaConf.load('./models/stage_1/volumetric_avatar/va.yaml')
         cfg = self.cfg
         print("👹 args:",cfg.gen_embed_size)
+
+        print("OLD args:",DELETE)
         self.exp_dir = exp_dir
       
         self.va_config = VolumetricAvatarConfig(self.cfg)
@@ -121,7 +123,7 @@ class Model(nn.Module):
 
         # Apply weight standartization 
         if self.cfg.use_ws:
-            volumetric_avatar.utils.apply_ws_to_nets(self)
+            volumetric_avatar.utils.apply_ws_to_networks(self.cfg.ws_networks)
 
         # Calculate params
         calculate_obj_params(self)

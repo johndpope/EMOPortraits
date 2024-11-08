@@ -1108,7 +1108,19 @@ def apply_ws_to_nets(obj):
             pass
             # if obj.args.print_norms and obj.rank==0:
             #     print(e)
-
+def apply_ws_to_networks(networks):
+    ws_nets_names = args_utils.parse_str_to_list(networks, sep=',')
+    for net_name in ws_nets_names:
+        try:
+            net = getattr(obj, net_name)
+            new_net = replace_conv_to_ws_conv(net, conv2d=True, conv3d=True)
+            setattr(obj, net_name, new_net)
+            if obj.args.print_norms and obj.rank==0:
+                print(f'WS applied to {net_name}')
+        except Exception as e:
+            pass
+            # if obj.args.print_norms and obj.rank==0:
+            #     print(e)
 
 class ProjectorNorm(nn.Module):
     def __init__(self, net_or_nets,
