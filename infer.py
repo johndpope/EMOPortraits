@@ -81,8 +81,9 @@ class InferenceWrapper(nn.Module):
 
         # Get a config for the network
         # args_path = pathlib.Path(project_dir) / folder / experiment_name / 'args.txt' if args_path is None else args_path
+        self.args = OmegaConf.load('./models/stage_1/volumetric_avatar/va.yaml')
 
-        self.args = OmegaConf.load("config.yaml")
+        # self.args = OmegaConf.load("config.yaml")
         # Add args from args_overwrite dict that overwrite the default ones
         self.args.project_dir = project_dir
         if args_overwrite is not None:

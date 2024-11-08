@@ -27,8 +27,8 @@ def apply_spectral_norm(module, name='weight', apply_to=['conv2d', ], n_power_it
 
 
 def apply_sp_to_nets(obj):
-    spn_layers = args_utils.parse_str_to_list(obj.args.spn_layers, sep=',')
-    spn_nets_names = args_utils.parse_str_to_list(obj.args.spn_networks, sep=',')
+    spn_layers = args_utils.parse_str_to_list(obj.cfg.spn_layers, sep=',')
+    spn_nets_names = args_utils.parse_str_to_list(obj.cfg.spn_networks, sep=',')
     for net_name in spn_nets_names:
         try:
             net = getattr(obj, net_name)

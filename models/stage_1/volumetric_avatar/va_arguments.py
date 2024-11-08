@@ -566,6 +566,9 @@ class VolumetricAvatarConfig:
         return parser_out
 
 
+    def __init__(self, args):
+         self.args = args
+
 
     def get_weights(self):
         return {

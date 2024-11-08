@@ -1,5 +1,8 @@
 num_source_frames: 1
 num_target_frames: 1
+model_checkpoint: ''
+warp_output_size: 64
+gen_latent_texture_size: 64
 
 paths:
   project_dir: "./"

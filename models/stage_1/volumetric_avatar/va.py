@@ -5,9 +5,7 @@ from argparse import ArgumentParser
 import numpy as np
 import itertools
 from torch.cuda import amp
-import os
-import sys
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# sys.path.append('/fsx/nikitadrobyshev/')
 from networks import basic_avatar, volumetric_avatar
 from utils import args as args_utils
 from utils import spectral_norm, weight_init, point_transforms
@@ -30,6 +28,7 @@ from ibug.roi_tanh_warping import roi_tanh_polar_restore, roi_tanh_polar_warp
 from torchvision import transforms
 from .va_arguments import VolumetricAvatarConfig
 from utils import point_transforms
+from omegaconf import OmegaConf
 
 
 
@@ -40,22 +39,21 @@ import contextlib
 
 class Model(nn.Module):
 
-    def __init__(self, args, training=True, rank=0, exp_dir=None):
+    def __init__(self, DELETE, training=True, rank=0, exp_dir=None):
         super(Model, self).__init__()
-        self.args = args
+        self.cfg = OmegaConf.load('./models/stage_1/volumetric_avatar/va.yaml')
+        cfg = self.cfg
+        print("👹 args:",cfg.gen_embed_size)
         self.exp_dir = exp_dir
-        # print(self.exp_dir)
-        self.va_config = VolumetricAvatarConfig.from_config_yaml(args)
-        print("🥊  self.va_config:",self.va_config)
-        print("🥊  self.args:",self.args)
-        
-        self.weights = self.va_config.losses
+      
+        self.va_config = VolumetricAvatarConfig(self.cfg)
+        self.weights = self.va_config.get_weights()
 
-
+       
         
         self.rank=rank
-        self.num_source_frames = args.num_source_frames
-        self.num_target_frames = args.num_target_frames
+        self.num_source_frames = self.cfg.num_source_frames
+        self.num_target_frames = self.cfg.num_target_frames
         self.resize_d = lambda img: F.interpolate(img, mode='bilinear',
                                            size=(224, 224),
                                            align_corners=False)
@@ -63,72 +61,75 @@ class Model(nn.Module):
         self.resize_u = lambda img: F.interpolate(img, mode='bilinear',
                                            size=(256, 256),
                                            align_corners=False)
+        
 
-
-        self.embed_size = args.gen_embed_size
-        self.pred_seg = args.dec_pred_seg
-        self.use_stylegan_d = args.use_stylegan_d
+        self.embed_size = self.cfg.gen_embed_size
+        self.num_source_frames = self.cfg.num_source_frames  # number of identities per batch
+ 
+ 
+        self.pred_seg = self.cfg.dec_pred_seg
+        self.use_stylegan_d = self.cfg.use_stylegan_d
         self.bn = nn.BatchNorm1d(512, affine=False)
         self.thetas_pool = []
         if self.pred_seg:
             self.seg_loss = nn.BCELoss()
-        self.pred_flip = args.gen_pred_flip
-        self.pred_mixing = args.gen_pred_mixing
+        self.pred_flip = self.cfg.gen_pred_flip
+        self.pred_mixing = self.cfg.gen_pred_mixing
         assert self.num_source_frames == 1, 'No support for multiple sources'
         self.background_net_input_channels = 64
 
 
-        # if self.args.w_eyes_loss_l1>0 or self.args.w_mouth_loss_l1>0 or self.args.w_ears_loss_l1>0:
+        # if self.cfg.w_eyes_loss_l1>0 or self.cfg.w_mouth_loss_l1>0 or self.cfg.w_ears_loss_l1>0:
         self.face_parsing_bug = FaceParsingBUG()
 
 
         self.m_key_diff = 0
-        self.init_networks(args, training)
+        self.init_networks(cfg, training)
 
 
         self.prev_targets = None
-        self.autocast = args.use_amp_autocast
-        self.apply(weight_init.weight_init(args.init_type, args.init_gain))
-        self.dec_pred_conf = args.dec_pred_conf
-        self.sep_train_losses = args.sep_train_losses
-        self.resize_warp = args.warp_output_size != args.gen_latent_texture_size
+        self.autocast = self.cfg.use_amp_autocast
+        self.apply(weight_init.weight_init(cfg.init_type, self.cfg.init_gain))
+        self.dec_pred_conf = self.cfg.dec_pred_conf
+        self.sep_train_losses = self.cfg.sep_train_losses
+        self.resize_warp = self.cfg.warp_output_size != self.cfg.gen_latent_texture_size
         self.warp_resize_stride = (
-            1, args.warp_output_size // args.gen_latent_texture_size,
-            args.warp_output_size // args.gen_latent_texture_size)
+            1, self.cfg.warp_output_size // self.cfg.gen_latent_texture_size,
+            self.cfg.warp_output_size // self.cfg.gen_latent_texture_size)
         self.resize_func = lambda x: F.avg_pool3d(x, kernel_size=self.warp_resize_stride,
                                                   stride=self.warp_resize_stride)
         self.resize_warp_func = lambda x: F.avg_pool3d(x.permute(0, 4, 1, 2, 3), kernel_size=self.warp_resize_stride,
                                                        stride=self.warp_resize_stride).permute(0, 2, 3, 4, 1)
-        grid_s = torch.linspace(-1, 1, self.args.aug_warp_size)
+        grid_s = torch.linspace(-1, 1, self.cfg.aug_warp_size)
         v, u = torch.meshgrid(grid_s, grid_s)
         self.register_buffer('identity_grid_2d', torch.stack([u, v], dim=2).view(1, -1, 2), persistent=False)
 
-        grid_s = torch.linspace(-1, 1, self.args.latent_volume_size)
-        grid_z = torch.linspace(-1, 1, self.args.latent_volume_depth)
+        grid_s = torch.linspace(-1, 1, self.cfg.latent_volume_size)
+        grid_z = torch.linspace(-1, 1, self.cfg.latent_volume_depth)
         w, v, u = torch.meshgrid(grid_z, grid_s, grid_s)
         e = torch.ones_like(u)
         self.register_buffer('identity_grid_3d', torch.stack([u, v, w, e], dim=3).view(1, -1, 4), persistent=False)
-        self.only_cycle_embed = args.only_cycle_embed
+        self.only_cycle_embed = self.cfg.only_cycle_embed
 
-        self.use_masked_aug = args.use_masked_aug
-        self.num_b_negs = self.args.num_b_negs
-        self.pred_cycle = args.pred_cycle
+        self.use_masked_aug = self.cfg.use_masked_aug
+        self.num_b_negs = self.cfg.num_b_negs
+        self.pred_cycle = self.cfg.pred_cycle
 
         # # Apply spectral norm
-        if args.use_sn:
+        if self.cfg.use_sn:
             spectral_norm.apply_sp_to_nets(self)
 
         # Apply weight standartization 
-        if args.use_ws:
+        if self.cfg.use_ws:
             volumetric_avatar.utils.apply_ws_to_nets(self)
 
         # Calculate params
         calculate_obj_params(self)
 
         if training:
-            self.init_losses(args)
+            self.init_losses(cfg)
 
-    def init_networks(self, args, training):
+    def init_networks(self, cfg, training):
         
         ##################################
         #### Encoders ####
@@ -138,11 +139,11 @@ class Model(nn.Module):
         self.local_encoder_nw = volumetric_avatar.LocalEncoder(self.va_config.local_encoder_cfg)
 
         ## Define background nets; default = False
-        if self.args.use_back:
-            in_u = self.args.background_net_input_channels
-            c = self.args.latent_volume_channels
-            d = self.args.latent_volume_depth
-            self.background_net_out_channels = self.args.latent_volume_depth * self.args.latent_volume_channels
+        if self.cfg.use_back:
+            in_u = self.cfg.background_net_input_channels
+            c = self.cfg.latent_volume_channels
+            d = self.cfg.latent_volume_depth
+            self.background_net_out_channels = self.cfg.latent_volume_depth * self.cfg.latent_volume_channels
             u = self.background_net_out_channels
             
             self.local_encoder_back_nw = volumetric_avatar.LocalEncoderBack(self.va_config.local_encoder_back_cfg)
@@ -156,10 +157,10 @@ class Model(nn.Module):
                 nn.ReLU(),
             ])
 
-            self.background_process_nw = volumetric_avatar.UNet(in_u, u, base=self.args.back_unet_base, max_ch=self.args.back_unet_max_ch, norm='gn')
+            self.background_process_nw = volumetric_avatar.UNet(in_u, u, base=cfg.back_unet_base, max_ch=cfg.back_unet_max_ch, norm='gn')
 
         # Define volume rendering net; default = False
-        if self.args.volume_rendering:
+        if self.cfg.volume_rendering:
             self.volume_renderer_nw = volumetric_avatar.VolumeRenderer(self.va_config.volume_renderer_cfg)
 
         # Define idt embedder net - for adaptivity of networks and for face warping help
@@ -174,14 +175,14 @@ class Model(nn.Module):
         ##################################
 
         # Operator that transform exp_emb to extended exp_emb (to match idt_emb size)
-        self.pose_unsqueeze_nw = nn.Linear(args.lpe_output_channels_expression, args.gen_max_channels * self.embed_size ** 2,
+        self.pose_unsqueeze_nw = nn.Linear(cfg.lpe_output_channels_expression, self.cfg.gen_max_channels * self.embed_size ** 2,
                                         bias=False)
 
 
         # Operator that combine idt_imb and extended exp_emb together (a "+" sign of a scheme)
         self.warp_embed_head_orig_nw = nn.Conv2d(
-            in_channels=args.gen_max_channels*(2 if self.args.cat_em else 1),
-            out_channels=args.gen_max_channels,
+            in_channels=cfg.gen_max_channels*(2 if self.cfg.cat_em else 1),
+            out_channels=cfg.gen_max_channels,
             kernel_size=(1, 1),
             bias=False)
         
@@ -194,9 +195,9 @@ class Model(nn.Module):
         ##################################
 
         ## Define 3D net that goes right after image encoder
-        if self.args.source_volume_num_blocks>0:
+        if self.cfg.source_volume_num_blocks>0:
             
-            if self.args.unet_first:
+            if self.cfg.unet_first:
                 print('aaaaaaaaaaaaaaaa')
                 self.volume_source_nw = volumetric_avatar.Unet3D(self.va_config.unet3d_cfg_s)
             else:
@@ -207,10 +208,10 @@ class Model(nn.Module):
 
 
         # If we want to use additional learnable tensor - like avarage person
-        if self.args.use_tensor:
-            d = self.args.gen_latent_texture_depth
-            s = self.args.gen_latent_texture_size
-            c = self.args.gen_latent_texture_channels
+        if self.cfg.use_tensor:
+            d = self.cfg.gen_latent_texture_depth
+            s = self.cfg.gen_latent_texture_size
+            c = self.cfg.gen_latent_texture_channels
             self.avarage_tensor_ts = nn.Parameter(Variable(  (torch.rand((1,c,d,s,s), requires_grad = True)*2 - 1)*math.sqrt(6./(d*s*s*c))  ).cuda(), requires_grad = True)
 
         # Net that process volume after first duble-warping
@@ -218,9 +219,9 @@ class Model(nn.Module):
 
 
         ## Define 3D net that goes before image decoder
-        if self.args.pred_volume_num_blocks>0:
+        if self.cfg.pred_volume_num_blocks>0:
             
-            if self.args.unet_first:
+            if self.cfg.unet_first:
                 self.volume_pred_nw = volumetric_avatar.Unet3D(self.va_config.unet3d_cfg_s)
             else:
                 self.volume_pred_nw = volumetric_avatar.VPN_ResBlocks(self.va_config.VPN_resblocks_pred_cfg)
@@ -237,48 +238,48 @@ class Model(nn.Module):
         ##################################
         if training:
             self.discriminator_ds = basic_avatar.MultiScaleDiscriminator(self.va_config.dis_cfg)
-            self.discriminator_ds.apply(weight_init.weight_init(args.dis_init_type, args.dis_init_gain))
+            self.discriminator_ds.apply(weight_init.weight_init(cfg.dis_init_type, self.cfg.dis_init_gain))
 
-            if self.args.use_mix_dis:
+            if self.cfg.use_mix_dis:
                 self.discriminator2_ds = basic_avatar.MultiScaleDiscriminator(self.va_config.dis_2_cfg)
-                self.discriminator2_ds.apply(weight_init.weight_init(args.dis_init_type, args.dis_init_gain))
+                self.discriminator2_ds.apply(weight_init.weight_init(cfg.dis_init_type, self.cfg.dis_init_gain))
 
             if self.use_stylegan_d:
                 self.r1_loss = torch.tensor(0.0)
-                self.stylegan_discriminator_ds = basic_avatar.DiscriminatorStyleGAN2(size=self.args.image_size,
+                self.stylegan_discriminator_ds = basic_avatar.DiscriminatorStyleGAN2(size=cfg.image_size,
                                                                                   channel_multiplier=1, my_ch=2)
 
         
         ###########################################
         #### Non-trainable additional networks ####
         ###########################################
-        self.face_idt = volumetric_avatar.FaceParsing(None, 'cuda', project_dir = self.args.project_dir)
+        self.face_idt = volumetric_avatar.FaceParsing(None, 'cuda', project_dir = self.cfg.project_dir)
 
 
 
-        if self.args.use_mix_losses or self.pred_seg:
-            self.get_mask = MODNET(project_dir = self.args.project_dir)
+        if self.cfg.use_mix_losses or self.pred_seg:
+            self.get_mask = MODNET(project_dir = self.cfg.project_dir)
 
-        if self.args.estimate_head_pose_from_keypoints:
-            self.head_pose_regressor = volumetric_avatar.HeadPoseRegressor(args.head_pose_regressor_path, args.num_gpus)
+        if self.cfg.estimate_head_pose_from_keypoints:
+            self.head_pose_regressor = volumetric_avatar.HeadPoseRegressor(cfg.head_pose_regressor_path, self.cfg.num_gpus)
 
 
-        if args.warp_norm_grad:
-            self.grid_sample = volumetric_avatar.GridSample(args.gen_latent_texture_size)
+        if self.cfg.warp_norm_grad:
+            self.grid_sample = volumetric_avatar.GridSample(cfg.gen_latent_texture_size)
         else:
             self.grid_sample = lambda inputs, grid: F.grid_sample(inputs.float(), grid.float(),
-                                                                  padding_mode=self.args.grid_sample_padding_mode)
+                                                                  padding_mode=cfg.grid_sample_padding_mode)
 
         self.get_face_vector = volumetric_avatar.utils.Face_vector(self.head_pose_regressor, half=False)
-        self.get_face_vector_resnet = volumetric_avatar.utils.Face_vector_resnet(half=False, project_dir=self.args.project_dir)
+        self.get_face_vector_resnet = volumetric_avatar.utils.Face_vector_resnet(half=False, project_dir=cfg.project_dir)
         self.face_parsing_bug = FaceParsingBUG()
 
-        grid_s = torch.linspace(-1, 1, self.args.aug_warp_size)
+        grid_s = torch.linspace(-1, 1, self.cfg.aug_warp_size)
         v, u = torch.meshgrid(grid_s, grid_s)
         self.register_buffer('identity_grid_2d', torch.stack([u, v], dim=2).view(1, -1, 2), persistent=False)
 
-        grid_s = torch.linspace(-1, 1, self.args.latent_volume_size)
-        grid_z = torch.linspace(-1, 1, self.args.latent_volume_depth)
+        grid_s = torch.linspace(-1, 1, self.cfg.latent_volume_size)
+        grid_z = torch.linspace(-1, 1, self.cfg.latent_volume_depth)
         w, v, u = torch.meshgrid(grid_z, grid_s, grid_s)
         e = torch.ones_like(u)
         self.register_buffer('identity_grid_3d', torch.stack([u, v, w, e], dim=3).view(1, -1, 4), persistent=False)
@@ -294,15 +295,15 @@ class Model(nn.Module):
 
 
         b = data_dict['source_img'].shape[0]
-        c = self.args.latent_volume_channels
-        s = self.args.latent_volume_size
-        d = self.args.latent_volume_depth
+        c = self.cfg.latent_volume_channels
+        s = self.cfg.latent_volume_size
+        d = self.cfg.latent_volume_depth
 
         # If use face parsing mask 
-        if self.args.use_mix_mask:
+        if self.cfg.use_mix_mask:
             trashhold = 0.6
-            if self.args.use_ibug_mask:
-                if not self.args.use_old_fp:
+            if self.cfg.use_ibug_mask:
+                if not self.cfg.use_old_fp:
                     try:
                         face_mask_source_list = []
                         face_mask_target_list = []
@@ -367,9 +368,9 @@ class Model(nn.Module):
 
 
 
-        c = self.args.latent_volume_channels
-        s = self.args.latent_volume_size
-        d = self.args.latent_volume_depth
+        c = self.cfg.latent_volume_channels
+        s = self.cfg.latent_volume_size
+        d = self.cfg.latent_volume_depth
 
         # if iteration==200:
         #     print('aaaaaaaa')
@@ -377,7 +378,7 @@ class Model(nn.Module):
 
 
         # Estimate head rotation and corresponded warping
-        if self.args.estimate_head_pose_from_keypoints:
+        if self.cfg.estimate_head_pose_from_keypoints:
             with torch.no_grad():
                 data_dict['source_theta'], source_scale, data_dict['source_rotation'], source_tr = self.head_pose_regressor.forward(data_dict['source_img'], return_srt=True)
                 data_dict['target_theta'], target_scale, data_dict['target_rotation'], target_tr = self.head_pose_regressor.forward(data_dict['target_img'], return_srt=True)
@@ -414,7 +415,7 @@ class Model(nn.Module):
             data_dict['source_warped_keypoints_n']+=transform_matrix_s[:, None, :3, 3]
 
 
-            if self.args.aligned_warp_rot_source:
+            if self.cfg.aligned_warp_rot_source:
                 new_m_warp_s = inv_source_theta.bmm(transform_matrix_s)
                 data_dict['source_rotation_warp'] = grid.bmm(new_m_warp_s[:, :3].transpose(1, 2))
                 # data_dict['source_rotation_warp']+= transform_matrix_s[:, None, :3, 3]
@@ -426,7 +427,7 @@ class Model(nn.Module):
 
 
 
-            if self.args.aligned_warp_rot_target:
+            if self.cfg.aligned_warp_rot_target:
                 inv_transform_matrix  = transform_matrix_s.float().inverse().type(data_dict['target_theta'].type())
                 new_m_warp_t = inv_transform_matrix.bmm(data_dict['target_theta'])
                 data_dict['target_rotation_warp'] = grid.bmm(new_m_warp_t[:, :3].transpose(1, 2)).view(-1, d, s, s, 3)
@@ -438,7 +439,7 @@ class Model(nn.Module):
 
 
 
-            if self.args.predict_target_canon_vol and not (epoch==0 and iteration<0):
+            if self.cfg.predict_target_canon_vol and not (epoch==0 and iteration<0):
                 theta_st = point_transforms.get_transform_matrix(source_scale, data_dict['target_rotation'], target_tr)
                 inv_target_theta = theta_st.float().inverse().type(data_dict['target_theta'].type())
                 
@@ -472,7 +473,7 @@ class Model(nn.Module):
 
         # Idt and expression vectors
         data_dict['idt_embed'] = self.idt_embedder_nw(data_dict['source_img'] * data_dict['source_mask'])
-        data_dict = self.expression_embedder_nw(data_dict, self.args.estimate_head_pose_from_keypoints,
+        data_dict = self.expression_embedder_nw(data_dict, self.cfg.estimate_head_pose_from_keypoints,
                                              self.use_masked_aug)
 
         # Produce embeddings for warping
@@ -497,7 +498,7 @@ class Model(nn.Module):
         data_dict['target_uv_warp_resize'] = target_uv_warp_resize
 
         # Adding back features to face features, # default: False, as we don't use background net
-        if self.args.use_back: 
+        if self.cfg.use_back: 
             seg_encod_input = data_dict['source_img'] * (1 - data_dict['source_mask'])
             source_latents_background = self.local_encoder_back_nw(seg_encod_input)
             target_latent_feats_back = self.background_process_nw(source_latents_background)
@@ -507,20 +508,20 @@ class Model(nn.Module):
         
 
         # features 3D prepocess
-        if self.args.unet_first:
+        if self.cfg.unet_first:
             latent_volume = self.volume_process_nw(latent_volume, embed_dict)
         else:
-            if self.args.source_volume_num_blocks > 0:
+            if self.cfg.source_volume_num_blocks > 0:
                 latent_volume = self.volume_source_nw(latent_volume)
 
 ###############################################
-        if self.args.detach_lat_vol>0:
-            if iteration%self.args.detach_lat_vol==0:
+        if self.cfg.detach_lat_vol>0:
+            if iteration%cfg.detach_lat_vol==0:
                 latent_volume = latent_volume.detach()
 
 
-        if self.args.freeze_proc_nw>0:
-            if iteration%self.args.freeze_proc_nw==0:
+        if self.cfg.freeze_proc_nw>0:
+            if iteration%cfg.freeze_proc_nw==0:
                 for param in self.volume_process_nw.parameters():
                     param.requires_grad = False
             else:
@@ -535,8 +536,8 @@ class Model(nn.Module):
             data_dict['source_xy_warp_resize'])
 
         # Process latent texture
-        if self.args.unet_first:
-            if self.args.source_volume_num_blocks > 0:
+        if self.cfg.unet_first:
+            if self.cfg.source_volume_num_blocks > 0:
                 canonical_latent_volume = self.volume_source_nw(latent_volume)
         else:
             canonical_latent_volume = self.volume_process_nw(latent_volume, embed_dict)
@@ -545,22 +546,22 @@ class Model(nn.Module):
 
 
 
-        if self.args.use_tensor:
+        if self.cfg.use_tensor:
             canonical_latent_volume+=self.avarage_tensor_ts
 
 
 
         # # Features 3D prepocess after adding avrg tensor
-        # if self.args.pred_volume_num_blocks > 0:
+        # if self.cfg.pred_volume_num_blocks > 0:
         #     canonical_latent_volume = self.volume_pred_nw(canonical_latent_volume)
 
 
         # if want to apply self-supervise learning for canonical tensor
-        if self.args.predict_target_canon_vol and not (epoch==0 and iteration<0):
+        if self.cfg.predict_target_canon_vol and not (epoch==0 and iteration<0):
             data_dict['canon_volume'] = canonical_latent_volume
             with torch.no_grad():
                 xy_gen_warp_targ, data_dict['target_delta_xy'] = self.xy_generator_nw(target_warp_embed_dict)
-                if self.args.unet_first:
+                if self.cfg.unet_first:
                     _latent_volume = self.volume_process_nw(self.local_encoder_nw(data_dict['target_img'] * data_dict['target_mask']).view(b, c, d, s, s))
                     _latent_volume = self.grid_sample(self.grid_sample(_latent_volume, data_dict['target_inv_rotation_warp']), xy_gen_warp_targ)
                     _canonical_latent_volume = self.volume_source_nw(_latent_volume, embed_dict)
@@ -579,16 +580,16 @@ class Model(nn.Module):
             data_dict['target_rotation_warp'])
         
         # Features 3D prepocess
-        if self.args.pred_volume_num_blocks > 0:
+        if self.cfg.pred_volume_num_blocks > 0:
             aligned_target_volume = self.volume_pred_nw(aligned_target_volume)
 
         # Get final features before decoder
-        if self.args.use_back:
+        if self.cfg.use_back:
             aligned_target_volume = aligned_target_volume.view(b, c * d, s, s)
             aligned_target_volume = self.backgroung_adding_nw(
                 torch.cat((aligned_target_volume, target_latent_feats_back), dim=1))
         else:
-            if self.args.volume_rendering:
+            if self.cfg.volume_rendering:
                 aligned_target_volume, data_dict['pred_tar_img_vol'], data_dict['pred_tar_depth_vol'] = self.volume_renderer_nw(aligned_target_volume)
             else:
                 aligned_target_volume = aligned_target_volume.view(b, c * d, s, s)
@@ -597,15 +598,15 @@ class Model(nn.Module):
         data_dict['pred_target_img'], _, _, _ = self.decoder_nw(data_dict, target_warp_embed_dict, aligned_target_volume, False, iteration=iteration) ## _ reserved for some features for stage 2 of smt else
 
         # If we try to get the same emotion after first warping
-        if self.args.match_neutral:
+        if self.cfg.match_neutral:
             with contextlib.nullcontext() if (epoch==0 and iteration<200) else torch.no_grad():
                 canonical_latent_volume_n = canonical_latent_volume.clone()
-                if self.args.use_back:
+                if self.cfg.use_back:
                     canonical_latent_volume_n = canonical_latent_volume_n.view(b, c * d, s, s)
                     canonical_latent_volume_n = self.backgroung_adding_nw(
                         torch.cat((canonical_latent_volume_n, target_latent_feats_back), dim=1))
                 else:
-                    if self.args.volume_rendering:
+                    if self.cfg.volume_rendering:
                         canonical_latent_volume_n, data_dict['pred_tar_img_vol'], data_dict['pred_tar_depth_vol'] = self.volume_renderer_nw(canonical_latent_volume_n)
                     else:
                         canonical_latent_volume_n = canonical_latent_volume_n.view(b, c * d, s, s)
@@ -627,17 +628,17 @@ class Model(nn.Module):
             data_dict['pred_target_img_flip'] = None
 
         # Decode into image
-        if not self.args.use_back:
+        if not self.cfg.use_back:
             data_dict['target_img'] = data_dict['target_img'] * data_dict['target_mask'].detach()
 
-            if self.args.green:
+            if self.cfg.green:
                 green = torch.ones_like(data_dict['target_img'])*(1-data_dict['target_mask'].detach())
                 green[:, 0, :, :] = 0
                 green[:, 2, :, :] = 0
                 data_dict['target_img'] += green
 
         if self.pred_mixing or not self.training:
-            if self.args.use_mix_losses and self.training:
+            if self.cfg.use_mix_losses and self.training:
 
                 #########################
                 ### Mixing prediction ###
@@ -652,7 +653,7 @@ class Model(nn.Module):
                 aligned_mixing_feat = self.grid_sample(canonical_latent_volume, mixing_uv_warp_resize)
 
                 # Getting mixing theta - scales from source all other from target. Sometimes random theta to remove angle from vector
-                mixing_theta, self.thetas_pool = get_mixing_theta(self.args, data_dict['source_theta'], data_dict['target_theta'], self.thetas_pool, self.args.random_theta)
+                mixing_theta, self.thetas_pool = get_mixing_theta(self.args, data_dict['source_theta'], data_dict['target_theta'], self.thetas_pool, self.cfg.random_theta)
 
                 # Warp loatent volume again but by rotation
                 mixing_align_warp = self.identity_grid_3d.repeat_interleave(b, dim=0)
@@ -661,16 +662,16 @@ class Model(nn.Module):
                 aligned_mixing_feat = self.grid_sample(aligned_mixing_feat, mixing_align_warp_resize)
 
 
-                if self.args.pred_volume_num_blocks > 0:
+                if self.cfg.pred_volume_num_blocks > 0:
                     aligned_mixing_feat = self.volume_pred_nw(aligned_mixing_feat)
 
                 # Get final features before decoder
-                if self.args.use_back:
+                if self.cfg.use_back:
                     aligned_mixing_feat = aligned_mixing_feat.view(b, c * d, s, s)
                     aligned_mixing_feat = self.backgroung_adding_nw(
                         torch.cat((aligned_mixing_feat, target_latent_feats_back.detach()), dim=1))
                 else:
-                    if self.args.volume_rendering:
+                    if self.cfg.volume_rendering:
                         aligned_mixing_feat, data_dict['pred_mixing_img_vol'], data_dict['pred_mixing_depth_vol'] = self.volume_renderer_nw(aligned_mixing_feat)
                     else:
                         aligned_mixing_feat = aligned_mixing_feat.view(b, c * d, s, s)
@@ -706,7 +707,7 @@ class Model(nn.Module):
                 data_dict_exp['source_mask'] = data_dict['target_mask']
                 data_dict_exp['target_img'] = data_dict['pred_mixing_img']
                 data_dict_exp['target_mask'] = data_dict['pred_mixing_mask']
-                data_dict_exp = self.expression_embedder_nw(data_dict_exp, self.args.estimate_head_pose_from_keypoints,
+                data_dict_exp = self.expression_embedder_nw(data_dict_exp, self.cfg.estimate_head_pose_from_keypoints,
                                                          self.use_masked_aug, use_aug=False)
                 data_dict['mixing_img_align'] = data_dict_exp['target_img_align']
 
@@ -723,7 +724,7 @@ class Model(nn.Module):
                 data_dict_exp['source_mask'] = data_dict['target_mask']
                 data_dict_exp['target_img'] = data_dict['pred_mixing_img'].roll(-1, dims=0)
                 data_dict_exp['target_mask'] = data_dict['pred_mixing_mask'].roll(-1, dims=0)
-                data_dict_exp = self.expression_embedder_nw(data_dict_exp, self.args.estimate_head_pose_from_keypoints,
+                data_dict_exp = self.expression_embedder_nw(data_dict_exp, self.cfg.estimate_head_pose_from_keypoints,
                                                          self.use_masked_aug, use_aug=False)
 
                 _, target_warp_cycle_exp, _, origin_cycle_exp = self.predict_embed(data_dict_exp)
@@ -751,16 +752,16 @@ class Model(nn.Module):
                         self.grid_sample(self.grid_sample(canonical_latent_volume, target_uv_warp_resize),
                                          data_dict['target_rotation_warp'])
                 
-                    if self.args.pred_volume_num_blocks > 0:
+                    if self.cfg.pred_volume_num_blocks > 0:
                         target_latent_feats = self.volume_pred_nw(target_latent_feats)
 
                 
-                    if self.args.use_back:
+                    if self.cfg.use_back:
                         target_latent_feats = pred_cycle_expression_vol.view(b, c * d, s, s)
                       #  target_latent_feats = target_latent_feats + target_latent_feats_back.detach()
                         target_latent_feats = self.backgroung_adding_nw(torch.cat((target_latent_feats, target_latent_feats_back.detach()), dim=1))
                     else:
-                        if self.args.volume_rendering:
+                        if self.cfg.volume_rendering:
                             target_latent_feats, data_dict['pred_mixing_img_vol'], data_dict['pred_mixing_depth_vol'] = self.volume_renderer_nw(pred_cycle_expression_vol)
                         else:
                             target_latent_feats = pred_cycle_expression_vol.view(b, c * d, s, s)
@@ -777,7 +778,7 @@ class Model(nn.Module):
 
                     aligned_mixing_feat = self.grid_sample(canonical_latent_volume, mixing_uv_warp_resize)
 
-                    mixing_theta, self.thetas_pool = get_mixing_theta(self.args, data_dict['source_theta'], data_dict['target_theta'], self.thetas_pool, self.args.random_theta)
+                    mixing_theta, self.thetas_pool = get_mixing_theta(self.args, data_dict['source_theta'], data_dict['target_theta'], self.thetas_pool, self.cfg.random_theta)
                     mixing_align_warp = self.identity_grid_3d.repeat_interleave(b, dim=0)
                     mixing_align_warp = mixing_align_warp.bmm(mixing_theta.transpose(1, 2)).view(b,*mixing_uv_warp.shape[1:4],3)
                     if self.resize_warp:
@@ -788,14 +789,14 @@ class Model(nn.Module):
                     aligned_mixing_feat = self.grid_sample(aligned_mixing_feat, mixing_align_warp_resize)
 
 
-                    if self.args.pred_volume_num_blocks > 0:
+                    if self.cfg.pred_volume_num_blocks > 0:
                         aligned_mixing_feat = self.volume_pred_nw(aligned_mixing_feat)
 
-                    if self.args.use_back:
+                    if self.cfg.use_back:
                         target_latent_feats = aligned_mixing_feat.view(b, c * d, s, s)
                         target_latent_feats = self.backgroung_adding_nw(torch.cat((target_latent_feats, target_latent_feats_back.detach()), dim=1))
                     else:
-                        if self.args.volume_rendering:
+                        if self.cfg.volume_rendering:
                             aligned_mixing_feat, data_dict['pred_mixing_img_vol'], data_dict[
                                 'pred_mixing_depth_vol'] = self.volume_renderer_nw(aligned_mixing_feat)
                         else:
@@ -803,7 +804,7 @@ class Model(nn.Module):
 
                     self.decoder_nw.eval()
 
-                    if  self.args.use_back:
+                    if  self.cfg.use_back:
                         aligned_mixing_feat = self.backgroung_adding_nw(
                             torch.cat((aligned_mixing_feat, target_latent_feats_back.detach()), dim=1))
 
@@ -828,7 +829,7 @@ class Model(nn.Module):
                                                                                         self.embed_size)
 
         if self.pred_mixing:
-            if self.args.detach_warp_mixing_embed:
+            if self.cfg.detach_warp_mixing_embed:
                 warp_mixing_embed = warp_target_embed.detach()
             else:
                 warp_mixing_embed = warp_target_embed.clone()
@@ -853,7 +854,7 @@ class Model(nn.Module):
         for k, (pose_embed, m) in enumerate(zip(pose_embeds, num_frames)):
 
 
-            if self.args.cat_em:
+            if self.cfg.cat_em:
                 warp_embed_orig = self.warp_embed_head_orig_nw(torch.cat([pose_embed, data_dict['idt_embed'].repeat_interleave(m, dim=0)], dim=1))
                 warp_embed_orig_d = self.warp_embed_head_orig_nw(torch.cat([pose_embed.detach(), data_dict['idt_embed'].repeat_interleave(m, dim=0)], dim=1))
             else:
@@ -867,11 +868,11 @@ class Model(nn.Module):
             warp_embed_dicts[k]['ada_v'] = embd[k]
             warp_embed_orig_ = warp_embed_orig.view(b * m * c, self.embed_size ** 2)
 
-            if self.args.gen_use_adaconv:
+            if self.cfg.gen_use_adaconv:
                 for name, layer in self.warp_embed_head_dict.items():
                     warp_embed_dicts[k][name] = layer(warp_embed_orig_).view(b * m, c // 2, -1)
 
-        if self.args.gen_use_adanorm or self.args.gen_use_adaconv:
+        if self.cfg.gen_use_adanorm or self.cfg.gen_use_adaconv:
             # Predict embeds
             embed_orig = self.embed_head_orig(data_dict['idt_embed'])
 
@@ -880,7 +881,7 @@ class Model(nn.Module):
             embed_orig_ = embed_orig.view(b * c, self.embed_size ** 2)
       
 
-        if self.args.gen_use_adaconv:
+        if self.cfg.gen_use_adaconv:
             for name, layer in self.embed_head_dict.items():
                 embed_dict[name] = layer(embed_orig_).view(b, c // 2, -1)
           
@@ -916,7 +917,7 @@ class Model(nn.Module):
         mode = self.optimizer_idx_to_mode[optimizer_idx]
         self.ffhq_per_b = ffhq_per_b
 
-        s = self.args.image_additional_size if self.args.image_additional_size is not None else data_dict['target_img'].shape[-1]
+        s = self.cfg.image_additional_size if self.cfg.image_additional_size is not None else data_dict['target_img'].shape[-1]
         
         resize = lambda img: F.interpolate(img, mode='bilinear', size=(s, s), align_corners=False)
 
@@ -934,7 +935,7 @@ class Model(nn.Module):
                 for p in self.discriminator_ds.parameters():
                     p.requires_grad = False
 
-                if self.args.use_mix_dis:
+                if self.cfg.use_mix_dis:
                     self.discriminator2_ds.eval()
                     for p in self.discriminator2_ds.parameters():
                         p.requires_grad = False
@@ -943,14 +944,14 @@ class Model(nn.Module):
                 with torch.no_grad():
                     _, data_dict['real_feats_gen'] = self.discriminator_ds(resize(data_dict['target_img']))
 
-                    if self.args.use_mix_dis:
+                    if self.cfg.use_mix_dis:
                         _, data_dict['real_feats_gen_2'] = self.discriminator2_ds(data_dict['pred_target_img'].clone().detach())
 
                 # With grad as it is predict
                 data_dict['fake_score_gen'], data_dict['fake_feats_gen'] = self.discriminator_ds(
                     resize(data_dict['pred_target_img']))
 
-                if self.args.use_mix_dis:
+                if self.cfg.use_mix_dis:
                     data_dict['fake_score_gen_mix'], _ = self.discriminator2_ds(
                         resize(data_dict['pred_mixing_img']))
 
@@ -969,7 +970,7 @@ class Model(nn.Module):
                     losses_dict["g_style"] = self.weights['stylegan_weight'] * g_nonsaturating_loss(
                         data_dict['fake_style_score_gen'])
 
-                    if self.args.use_mix_losses and epoch >= self.args.mix_losses_start:
+                    if self.cfg.use_mix_losses and epoch >= self.cfg.mix_losses_start:
                         data_dict['fake_style_score_gen_mix'] = self.stylegan_discriminator_ds(
                             (data_dict['pred_mixing_img'] - 0.5) * 2)
 
@@ -989,7 +990,7 @@ class Model(nn.Module):
 
         elif mode == 'dis':
 
-            if self.args.detach_dis_inputs:
+            if self.cfg.detach_dis_inputs:
                 data_dict['target_img'] = torch.tensor(data_dict['target_img'].detach().clone().data, requires_grad=True)
                 # data_dict['target_img'] = torch.tensor(data_dict['target_img'], requires_grad=False)
                 data_dict['pred_target_img'] = torch.tensor(data_dict['pred_target_img'].detach().clone().data, requires_grad=True)
@@ -1000,7 +1001,7 @@ class Model(nn.Module):
             for p in self.discriminator_ds.parameters():
                 p.requires_grad = True
 
-            if self.args.use_mix_dis:
+            if self.cfg.use_mix_dis:
                 self.discriminator2_ds.train()
                 for p in self.discriminator2_ds.parameters():
                     p.requires_grad = True
@@ -1008,11 +1009,11 @@ class Model(nn.Module):
             data_dict['real_score_dis'], _ = self.discriminator_ds(resize(data_dict['target_img']))
             data_dict['fake_score_dis'], _ = self.discriminator_ds(resize(data_dict['pred_target_img'].detach()))
 
-            if self.args.use_mix_dis:
+            if self.cfg.use_mix_dis:
                 data_dict['real_score_dis_mix'], _ = self.discriminator2_ds(resize(data_dict['pred_target_img'].clone().detach()))
                 data_dict['fake_score_dis_mix'], _ = self.discriminator2_ds(resize(data_dict['pred_mixing_img'].clone().detach()))
             
-            # if self.args.use_exp_v_dis:
+            # if self.cfg.use_exp_v_dis:
             #     data_dict['real_score_dis'], _ = self.discriminator_v_ds(torch.cat([data_dict['pred_target_img'].detach(), data_dict['target_pose_embed'].detach()], dim=1))
             #     data_dict['fake_score_dis'], _ = self.discriminator_v_ds(torch.cat([data_dict['mixing_cycle_exp'].detach(), data_dict['target_pose_embed'].detach()], dim=1))
 
@@ -1025,7 +1026,7 @@ class Model(nn.Module):
             for p in self.stylegan_discriminator_ds.parameters():
                 p.requires_grad = True
 
-            d_regularize = iteration % self.args.d_reg_every == 0
+            d_regularize = iteration % self.cfg.d_reg_every == 0
 
             if d_regularize:
                 data_dict['target_img'].requires_grad_()
@@ -1035,7 +1036,7 @@ class Model(nn.Module):
             real_pred = self.stylegan_discriminator_ds((data_dict['target_img'] - 0.5) * 2)
             losses_dict["d_style"] = d_logistic_loss(real_pred, fake_pred)
 
-            if self.args.use_mix_losses and epoch >= self.args.mix_losses_start:
+            if self.cfg.use_mix_losses and epoch >= self.cfg.mix_losses_start:
                 fake_pred_mix = self.stylegan_discriminator_ds((data_dict['pred_mixing_img'].detach() - 0.5) * 2)
                 fake_loss_mix = F.softplus(fake_pred_mix)
                 losses_dict["d_style"] += fake_loss_mix.mean()
@@ -1046,7 +1047,7 @@ class Model(nn.Module):
                                               scale_number='all',
                                               )
                 data_dict['target_img'].requires_grad_(False)
-                losses_dict["r1"] = r1_penalty * self.args.d_reg_every * self.args.r1
+                losses_dict["r1"] = r1_penalty * self.cfg.d_reg_every * self.cfg.r1
 
             loss = 0
             for k, v in losses_dict.items():
@@ -1099,32 +1100,32 @@ class Model(nn.Module):
                 lr=lr,
                 betas=(beta1, beta2))}
 
-        opt_gen = opts[self.args.gen_opt_type](
+        opt_gen = opts[cfg.gen_opt_type](
             self.gen_parameters(),
-            self.args.gen_lr,
-            self.args.gen_beta1,
-            self.args.gen_beta2)
+            self.cfg.gen_lr,
+            self.cfg.gen_beta1,
+            self.cfg.gen_beta2)
 
-        if self.args.use_mix_dis:
-            opt_dis = opts[self.args.dis_opt_type](
+        if self.cfg.use_mix_dis:
+            opt_dis = opts[cfg.dis_opt_type](
                 itertools.chain(self.discriminator_ds.parameters(), self.discriminator2_ds.parameters()),
-                self.args.dis_lr,
-                self.args.dis_beta1,
-                self.args.dis_beta2,
+                self.cfg.dis_lr,
+                self.cfg.dis_beta1,
+                self.cfg.dis_beta2,
             )
         else:
-            opt_dis = opts[self.args.dis_opt_type](
+            opt_dis = opts[cfg.dis_opt_type](
                 self.discriminator_ds.parameters(),
-                self.args.dis_lr,
-                self.args.dis_beta1,
-                self.args.dis_beta2,
+                self.cfg.dis_lr,
+                self.cfg.dis_beta1,
+                self.cfg.dis_beta2,
             )
 
         if self.use_stylegan_d:
-            d_reg_ratio = self.args.d_reg_every / (self.args.d_reg_every + 1)
+            d_reg_ratio = self.cfg.d_reg_every / (cfg.d_reg_every + 1)
             opt_dis_style = opts['adam'](
                 self.stylegan_discriminator_ds.parameters(),
-                self.args.dis_stylegan_lr * d_reg_ratio,
+                self.cfg.dis_stylegan_lr * d_reg_ratio,
                 0 ** d_reg_ratio,
                 0.99 ** d_reg_ratio,
             )
@@ -1154,34 +1155,34 @@ class Model(nn.Module):
                 pct_start=0.1
             )}
 
-        shd_gen = shds[self.args.gen_shd_type](
+        shd_gen = shds[cfg.gen_shd_type](
             opts[0],
-            self.args.gen_lr,
-            self.args.gen_shd_lr_min,
-            self.args.gen_shd_max_iters,
+            self.cfg.gen_lr,
+            self.cfg.gen_shd_lr_min,
+            self.cfg.gen_shd_max_iters,
             epochs,
             steps_per_epoch)
 
-        shd_dis = shds[self.args.dis_shd_type](
+        shd_dis = shds[cfg.dis_shd_type](
             opts[1],
-            self.args.dis_lr,
-            self.args.dis_shd_lr_min,
-            self.args.dis_shd_max_iters,
+            self.cfg.dis_lr,
+            self.cfg.dis_shd_lr_min,
+            self.cfg.dis_shd_max_iters,
             epochs,
             steps_per_epoch
         )
 
         if self.use_stylegan_d:
-            shd_dis_stylegan = shds[self.args.dis_shd_type](
+            shd_dis_stylegan = shds[cfg.dis_shd_type](
                 opts[2],
-                self.args.dis_stylegan_lr,
-                self.args.dis_shd_lr_min,
-                self.args.dis_shd_max_iters,
+                self.cfg.dis_stylegan_lr,
+                self.cfg.dis_shd_lr_min,
+                self.cfg.dis_shd_max_iters,
                 epochs,
                 steps_per_epoch
             )
 
-            return [shd_gen, shd_dis, shd_dis_stylegan], [self.args.gen_shd_max_iters, self.args.dis_shd_max_iters,
-                                                          self.args.dis_shd_max_iters]
+            return [shd_gen, shd_dis, shd_dis_stylegan], [cfg.gen_shd_max_iters, self.cfg.dis_shd_max_iters,
+                                                          self.cfg.dis_shd_max_iters]
         else:
-            return [shd_gen, shd_dis], [self.args.gen_shd_max_iters, self.args.dis_shd_max_iters]
+            return [shd_gen, shd_dis], [cfg.gen_shd_max_iters, self.cfg.dis_shd_max_iters]
