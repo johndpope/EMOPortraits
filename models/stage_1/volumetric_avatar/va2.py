@@ -26,7 +26,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import models
 
-
+from utils import point_transforms
 
 
 @dataclass
@@ -597,12 +597,10 @@ class Model(nn.Module):
         self.uv_generator = volumetric_avatar.WarpGenerator(warp_gen_config)
 
         # Initialize 3D processing networks
-        self.volume_process = volumetric_avatar.Unet3D(
-            in_channels=self.config.volume_channels,
-            out_channels=self.config.volume_channels,
-            num_blocks=self.config.volume_blocks,
-            base_channels=self.config.volume_channels
-        )
+
+        vol = volumetric_avatar.Unet3D.create_default()
+
+        self.volume_process = volumetric_avatar.Unet3D(vol)
 
         # Initialize decoder
         self.decoder = volumetric_avatar.Decoder(
@@ -669,49 +667,395 @@ class Model(nn.Module):
         """Initialize loss functions"""
         self.init_additional_losses()
 
-    def forward(self, data_dict: dict, phase: str = 'train', optimizer_idx: int = 0, 
-                visualize: bool = False, iteration: int = 0):
-        """Forward pass through the model.
+        
+    def G_forward(self, data_dict: dict, visualize: bool, iteration: int = 0, epoch: int = 0) -> dict:
+        """Main forward pass for generator following EMOPortraits architecture (Section 4).
+        
+        Implements the full generation pipeline as shown in Figure 4 of the paper:
+        1. Face mask generation and preprocessing 
+        2. Head pose estimation and warping
+        3. Expression and identity embedding
+        4. Canonical volume generation  
+        5. Target pose warping
+        6. Final image synthesis
         
         Args:
-            data_dict: Dictionary containing input data
-            phase: Current phase ('train' or 'test')
-            optimizer_idx: Index of current optimizer
-            visualize: Whether to generate visualizations
-            iteration: Current training iteration
+            data_dict: Dictionary containing source/target images and metadata
+            visualize: Whether to generate visualization outputs
+            iteration: Current training iteration 
+            epoch: Current training epoch
             
         Returns:
-            Tuple containing (loss, loss_dict, visuals, updated_data_dict)
+            Updated data_dict with generated images and intermediate outputs
         """
-        mode = ['gen', 'dis', 'dis_stylegan'][optimizer_idx]
+        self.visualize = visualize
         
-        if mode == 'gen':
-            # Prepare input data
-            data_dict = self.prepare_input_data(data_dict)
+        # Get basic dimensions
+        batch_size = data_dict['source_img'].shape[0]
+        channels = self.args.latent_volume_channels
+        spatial_size = self.args.latent_volume_size
+        depth = self.args.latent_volume_depth
+
+        # 1. Process face masks if enabled
+        if self.args.use_mix_mask:
+            data_dict = self._process_face_masks(data_dict)
+
+        # 2. Head pose estimation and warping
+        data_dict = self._estimate_head_pose(data_dict, batch_size)
+
+        # 3. Generate embeddings
+        # Extract features from masked source image
+        latent_volume = self.local_encoder(
+            data_dict['source_img'] * data_dict['source_mask']
+        )
+        
+        # Get identity and expression embeddings
+        data_dict['idt_embed'] = self.idt_embedder_nw(
+            data_dict['source_img'] * data_dict['source_mask']
+        )
+        data_dict = self.expression_embedder_nw(
+            data_dict, 
+            self.args.estimate_head_pose_from_keypoints,
+            self.use_masked_aug
+        )
+
+        # Generate warping embeddings
+        source_warp_dict, target_warp_dict, mixing_warp_dict, embed_dict = self.predict_embed(
+            data_dict
+        )
+
+        # 4. Generate canonical volume
+        data_dict, canonical_volume = self._create_canonical_volume(
+            data_dict=data_dict,
+            latent_volume=latent_volume,
+            source_warp_dict=source_warp_dict,
+            target_warp_dict=target_warp_dict,
+            embed_dict=embed_dict,
+            iteration=iteration,
+            epoch=epoch
+        )
+
+        # 5. Generate target warped volume
+        aligned_target_volume = self._generate_aligned_volume(
+            data_dict=data_dict,
+            canonical_volume=canonical_volume,
+            target_warp_dict=target_warp_dict,
+            batch_size=batch_size,
+            channels=channels,
+            depth=depth,
+            spatial_size=spatial_size
+        )
+
+        # 6. Generate final target image
+        data_dict = self._generate_target_image(
+            data_dict=data_dict,
+            target_warp_dict=target_warp_dict,
+            aligned_volume=aligned_target_volume,
+            iteration=iteration
+        )
+
+        # 7. Optional: Handle neutral expression matching
+        if self.args.match_neutral:
+            data_dict = self._handle_neutral_matching(
+                data_dict=data_dict,
+                canonical_volume=canonical_volume,
+                target_warp_dict=target_warp_dict,
+                batch_size=batch_size,
+                channels=channels,
+                depth=depth,
+                spatial_size=spatial_size,
+                iteration=iteration,
+                epoch=epoch
+            )
+
+        # 8. Optional: Handle mixing prediction for training
+        if self.pred_mixing or not self.training:
+            data_dict = self._handle_mixing_prediction(
+                data_dict=data_dict,
+                canonical_volume=canonical_volume,
+                mixing_warp_dict=mixing_warp_dict,
+                batch_size=batch_size,
+                channels=channels,
+                depth=depth,
+                spatial_size=spatial_size,
+                iteration=iteration,
+                epoch=epoch
+            )
+
+        return data_dict
+
+    def _create_canonical_volume(self, data_dict: dict, latent_volume: torch.Tensor,
+                            source_warp_dict: dict, target_warp_dict: dict, 
+                            embed_dict: dict, iteration: int, epoch: int) -> Tuple[dict, torch.Tensor]:
+        """Create expression-free canonical volume following Section 4.2.
+        
+        Args:
+            data_dict: Input data dictionary
+            latent_volume: Initial latent volume from encoder
+            source_warp_dict: Source warping embeddings
+            target_warp_dict: Target warping embeddings
+            embed_dict: Combined embedding dictionary
+            iteration: Current iteration
+            epoch: Current epoch
+        
+        Returns:
+            Tuple of (updated data_dict, canonical_volume)
+        """
+        # Reshape latent volume
+        batch_size = latent_volume.shape[0]
+        latent_volume = latent_volume.view(
+            batch_size, 
+            self.args.latent_volume_channels,
+            self.args.latent_volume_depth,
+            self.args.latent_volume_size,
+            self.args.latent_volume_size
+        )
+
+        # Process initial volume if needed
+        if self.args.unet_first:
+            latent_volume = self.volume_process_nw(latent_volume, embed_dict)
+        elif self.args.source_volume_num_blocks > 0:
+            latent_volume = self.volume_source_nw(latent_volume)
+
+        # Handle volume detachment
+        if self.args.detach_lat_vol > 0 and iteration % self.args.detach_lat_vol == 0:
+            latent_volume = latent_volume.detach()
+
+        # Handle processor network freezing
+        if self.args.freeze_proc_nw > 0:
+            for param in self.volume_process_nw.parameters():
+                param.requires_grad = (iteration % self.args.freeze_proc_nw != 0)
+
+        # Warp to canonical pose
+        latent_volume = self.grid_sample(
+            self.grid_sample(
+                latent_volume, 
+                data_dict['source_rotation_warp']
+            ),
+            data_dict['source_xy_warp_resize']
+        )
+
+        # Generate canonical volume
+        if self.args.unet_first:
+            if self.args.source_volume_num_blocks > 0:
+                canonical_volume = self.volume_source_nw(latent_volume)
+        else:
+            canonical_volume = self.volume_process_nw(latent_volume, embed_dict)
+
+        # Add average person tensor if enabled
+        if self.args.use_tensor:
+            canonical_volume = canonical_volume + self.avarage_tensor_ts
+
+        return data_dict, canonical_volume
+
+    def _generate_aligned_volume(self, data_dict: dict, canonical_volume: torch.Tensor,
+                            target_warp_dict: dict, batch_size: int, channels: int,
+                            depth: int, spatial_size: int) -> torch.Tensor:
+        """Generate target-aligned volume through warping."""
+        # Warp to target pose
+        aligned_volume = self.grid_sample(
+            self.grid_sample(
+                canonical_volume,
+                data_dict['target_uv_warp_resize']
+            ),
+            data_dict['target_rotation_warp']
+        )
+        
+        # Process aligned volume if needed
+        if self.args.pred_volume_num_blocks > 0:
+            aligned_volume = self.volume_pred_nw(aligned_volume)
+
+        # Reshape for decoder
+        aligned_volume = aligned_volume.view(batch_size, channels * depth, spatial_size, spatial_size)
+
+        return aligned_volume
+
+    def _generate_target_image(self, data_dict: dict, target_warp_dict: dict,
+                            aligned_volume: torch.Tensor, iteration: int) -> dict:
+        """Generate final target image from aligned volume."""
+        # Generate target image
+        data_dict['pred_target_img'], _, _, _ = self.decoder_nw(
+            data_dict,
+            target_warp_dict,
+            aligned_volume,
+            False,
+            iteration=iteration
+        )
+
+        # Apply masking if needed
+        if not self.args.use_back:
+            data_dict['target_img'] = (
+                data_dict['target_img'] * 
+                data_dict['target_mask'].detach()
+            )
             
-            # Run generator forward pass
-            data_dict = self.G_forward(data_dict, visualize, iteration)
+            # Add green background if enabled
+            if self.args.green:
+                green = torch.ones_like(data_dict['target_img']) * (
+                    1 - data_dict['target_mask'].detach()
+                )
+                green[:, 0, :, :] = 0  # Zero red channel
+                green[:, 2, :, :] = 0  # Zero blue channel
+                data_dict['target_img'] += green
+
+        return data_dict
+    
+    def _process_face_masks(self, data_dict: dict) -> dict:
+        """Process face masks for source and target images.
+        
+        As described in Section 4 of the paper, face masks help isolate relevant facial regions
+        for more accurate expression transfer.
+        
+        Args:
+            data_dict: Dictionary containing source_img, target_img, and associated masks
             
-            if phase == 'train':
-                # Calculate generator losses
-                loss, losses_dict = self._calculate_generator_losses(data_dict)
-            else:
-                # Calculate test metrics
-                loss = None
-                losses_dict = self._calculate_test_metrics(data_dict)
+        Returns:
+            Updated data_dict with processed masks
+        """
+        threshold = 0.6
+        
+        if not self.args.use_ibug_mask:
+            # Simple face parsing approach
+            face_mask_source, _, _, _ = self.face_idt.forward(data_dict['source_img'])
+            face_mask_target, _, _, _ = self.face_idt.forward(data_dict['target_img'])
+            face_mask_source = (face_mask_source > threshold).float()
+            face_mask_target = (face_mask_target > threshold).float()
+            
+            data_dict.update({
+                'source_mask_modnet': data_dict['source_mask'],
+                'target_mask_modnet': data_dict['target_mask'],
+                'source_mask_face_pars': face_mask_source.float(),
+                'target_mask_face_pars': face_mask_target.float(),
+                'source_mask': (data_dict['source_mask'] * face_mask_source).float(),
+                'target_mask': (data_dict['target_mask'] * face_mask_target).float()
+            })
+            return data_dict
+            
+        # Advanced face parsing with detailed features
+        try:
+            source_masks = []
+            target_masks = []
+            
+            for i in range(data_dict['source_img'].shape[0]):
+                # Get lips and face features
+                _, _, source_logits, _ = self.face_parsing_bug.get_lips(data_dict['source_img'][i])
+                _, _, target_logits, _ = self.face_parsing_bug.get_lips(data_dict['target_img'][i])
                 
-        elif mode == 'dis':
-            # Run discriminator forward pass and calculate losses
-            loss, losses_dict = self._discriminator_forward(data_dict)
-            
-        elif mode == 'dis_stylegan':
-            # Run StyleGAN discriminator forward pass if enabled
-            if self.use_stylegan_d:
-                loss, losses_dict = self._stylegan_discriminator_forward(data_dict, iteration)
-            else:
-                loss, losses_dict = None, {}
+                # Detach gradients
+                source_logits = source_logits.detach()
+                target_logits = target_logits.detach()
                 
-        # Generate visualizations if requested
-        visuals = self.get_visuals(data_dict) if visualize else None
+                # Extract primary face region (index 0)
+                source_masks.append(source_logits[:, 0:1])
+                target_masks.append(target_logits[:, 0:1])
+                
+            face_mask_source = torch.cat(source_masks, dim=0)
+            face_mask_target = torch.cat(target_masks, dim=0)
             
-        return loss, losses_dict, visuals, data_dict
+        except Exception as e:
+            print(f"Falling back to basic face parsing: {e}")
+            face_mask_source, _, _, _ = self.face_idt.forward(data_dict['source_img'])
+            face_mask_target, _, _, _ = self.face_idt.forward(data_dict['target_img'])
+        
+        # Get additional features like hats
+        _, _, hat_source, _ = self.face_idt.forward(data_dict['source_img'])
+        _, _, hat_target, _ = self.face_idt.forward(data_dict['target_img'])
+        
+        face_mask_source += hat_source
+        face_mask_target += hat_target
+        
+        # Process MODNET masks
+        data_dict['source_mask_modnet'] = data_dict['source_mask'].clone()
+        data_dict['target_mask_modnet'] = data_dict['target_mask'].clone()
+        data_dict['source_mask_modnet'][:, :, -256:] *= 0
+        data_dict['target_mask_modnet'][:, :, -256:] *= 0
+        
+        # Combine masks
+        face_mask_source = (face_mask_source + data_dict['source_mask_modnet'] >= threshold).float()
+        face_mask_target = (face_mask_target + data_dict['target_mask_modnet'] >= threshold).float()
+        
+        # Store results
+        data_dict.update({
+            'source_mask_face_pars_1': face_mask_source.float(),
+            'target_mask_face_pars_1': face_mask_target.float(),
+            'source_mask': (data_dict['source_mask'] * face_mask_source).float(),
+            'target_mask': (data_dict['target_mask'] * face_mask_target).float()
+        })
+        
+        return data_dict
+
+    def _estimate_head_pose(self, data_dict: dict, batch_size: int) -> dict:
+        """Estimate head pose and generate warping grids.
+        
+        Implements head pose estimation described in Section 4.2, generating transformation
+        matrices and warping grids for source and target poses.
+        
+        Args:
+            data_dict: Dictionary containing source/target images
+            batch_size: Batch size for tensor operations
+            
+        Returns:
+            Updated data_dict with pose estimates and warping grids
+        """
+        # Skip if not using keypoint-based estimation
+        if not self.args.estimate_head_pose_from_keypoints:
+            # Use 3DMM parameters instead
+            data_dict['source_rotation_warp'] = point_transforms.world_to_camera(
+                self.identity_grid_3d[..., :3],
+                data_dict['source_params_3dmm']
+            ).view(batch_size, self.args.latent_volume_depth, 
+                self.args.latent_volume_size, self.args.latent_volume_size, 3)
+                
+            data_dict['target_rotation_warp'] = point_transforms.camera_to_world(
+                self.identity_grid_3d[..., :3],
+                data_dict['target_params_3dmm']
+            ).view(batch_size, self.args.latent_volume_depth,
+                self.args.latent_volume_size, self.args.latent_volume_size, 3)
+            return data_dict
+        
+        # Estimate poses
+        with torch.no_grad():
+            data_dict['source_theta'], source_scale, data_dict['source_rotation'], source_tr = \
+                self.head_pose_regressor.forward(data_dict['source_img'], return_srt=True)
+            data_dict['target_theta'], target_scale, data_dict['target_rotation'], target_tr = \
+                self.head_pose_regressor.forward(data_dict['target_img'], return_srt=True)
+        
+        # Generate warping grid
+        grid = self.identity_grid_3d.repeat_interleave(batch_size, dim=0)
+        
+        # Process source pose
+        inv_source_theta = data_dict['source_theta'].float().inverse().type(data_dict['source_theta'].type())
+        data_dict['source_rotation_warp'] = grid.bmm(inv_source_theta[:, :3].transpose(1, 2)).view(
+            -1, self.args.latent_volume_depth, self.args.latent_volume_size, 
+            self.args.latent_volume_size, 3)
+            
+        # Compute keypoint transformations
+        data_dict['source_warped_keypoints'] = data_dict['source_keypoints'].bmm(inv_source_theta[:, :3, :3])
+        data_dict['source_warped_keypoints_n'] = self._normalize_keypoints(
+            data_dict['source_warped_keypoints'].clone())
+            
+        return data_dict
+
+    def _normalize_keypoints(self, keypoints: torch.Tensor) -> torch.Tensor:
+        """Normalize keypoint positions to canonical pose.
+        
+        Args:
+            keypoints: Source keypoints tensor
+            
+        Returns:
+            Normalized keypoints
+        """
+        # Set canonical nose keypoints
+        keypoints[:, 27:31] = torch.tensor([
+            [-0.0000, -0.2,  0.22],
+            [-0.0000, -0.13, 0.26],
+            [-0.0000, -0.06, 0.307],
+            [-0.0000, -0.008, 0.310]
+        ]).to(keypoints.device)
+        
+        return keypoints
+
+   
+
+    
+    

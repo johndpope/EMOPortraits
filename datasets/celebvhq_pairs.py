@@ -101,10 +101,10 @@ class CelebVHQDataset(data.Dataset):
             num_classes=14
         )
         
-        self.landmark_detector = FaceAlignment(
-            device=self.device,
-            model_type='2D'
-        )
+        # self.landmark_detector = FaceAlignment(
+        #     device=self.device,
+        #     model_type='2D'
+        # )
         
         self.bfm = MorphabelModel(bfm_path)
 

@@ -43,7 +43,7 @@ class WarpGenerator(nn.Module):
         gen_dummy_input_size: int = 8,
         gen_latent_texture_size: int = 16,
         input_channels: int = 3
-    ) -> 'WarpGeneratorConfig':
+    ) -> 'Config':
         """Create a default configuration with commonly used settings.
         
         Args:
