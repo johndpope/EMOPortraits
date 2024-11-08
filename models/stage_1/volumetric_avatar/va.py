@@ -44,9 +44,12 @@ class Model(nn.Module):
         super(Model, self).__init__()
         self.args = args
         self.exp_dir = exp_dir
-        print(self.exp_dir)
-        self.va_config = VolumetricAvatarConfig(args)
-        self.weights = self.va_config.get_weights()
+        # print(self.exp_dir)
+        self.va_config = VolumetricAvatarConfig.from_config_yaml(args)
+        print("🥊  self.va_config:",self.va_config)
+        print("🥊  self.args:",self.args)
+        
+        self.weights = self.va_config.losses
 
 
         
@@ -60,8 +63,8 @@ class Model(nn.Module):
         self.resize_u = lambda img: F.interpolate(img, mode='bilinear',
                                            size=(256, 256),
                                            align_corners=False)
-        self.embed_size = args.gen_embed_size
-        self.num_source_frames = args.num_source_frames  # number of identities per batch
+
+
         self.embed_size = args.gen_embed_size
         self.pred_seg = args.dec_pred_seg
         self.use_stylegan_d = args.use_stylegan_d
