@@ -810,12 +810,12 @@ class InferenceWrapper(nn.Module):
         return generated_frames, driving_frames
 
     def save_video(self,
-                source_img: PIL.Image.Image,
-                generated_frames: List[PIL.Image.Image], 
-                driving_frames: List[PIL.Image.Image],
-                output_path: str,
-                fps: float = 30.0,
-                size: Tuple[int, int] = (512, 512)):
+            source_img: PIL.Image.Image,
+            generated_frames: List[PIL.Image.Image], 
+            driving_frames: List[PIL.Image.Image],
+            output_path: str,
+            fps: float = 30.0,
+            size: Tuple[int, int] = (512, 512)):
         """Save video with source, driving and generated frames.
         
         Args:
@@ -831,14 +831,19 @@ class InferenceWrapper(nn.Module):
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         out = cv2.VideoWriter(output_path, fourcc, fps, out_size)
         
-        # Resize source once
-        source_array = np.array(source_img.resize(size))
+        # Convert source image to RGB and resize
+        source_img_rgb = source_img.convert('RGB')
+        source_array = np.array(source_img_rgb.resize(size))
         
         for gen_frame, drive_frame in zip(generated_frames, driving_frames):
-            # Create composite frame
-            gen_array = np.array(gen_frame.resize(size))
-            drive_array = np.array(drive_frame.resize(size))
+            # Ensure RGB format and resize
+            gen_frame_rgb = gen_frame.convert('RGB')
+            drive_frame_rgb = drive_frame.convert('RGB')
             
+            gen_array = np.array(gen_frame_rgb.resize(size))
+            drive_array = np.array(drive_frame_rgb.resize(size))
+            
+            # Concatenate frames
             composite = np.concatenate([source_array, drive_array, gen_array], axis=1)
             out.write(cv2.cvtColor(composite, cv2.COLOR_RGB2BGR))
             
@@ -896,7 +901,7 @@ inferer = InferenceWrapper(experiment_name = 'speedup', model_file_name = '328_m
 create_driven_video(
     source_path='data/IMG_1.png',
     video_path='data/VID_1.mp4',
-    output_path='data/result2.mp4',
+    output_path='data/result3.mp4',
     inferer=inferer,
     max_frames=None,  # Process all frames
     fps=30.0
