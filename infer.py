@@ -837,6 +837,110 @@ class InferenceWrapper(nn.Module):
         print(f"Average time per frame: {1000 * total_time / len(driving_frames):.2f}ms")
         
         return generated_frames, driving_frames
+    
+
+    def batch_process_video(self, 
+                source_img: PIL.Image.Image,
+                video_path: str,
+                max_frames: Optional[int] = None,
+                batch_size: int = 8) -> Tuple[List[PIL.Image.Image], List[PIL.Image.Image]]:
+        """Process video frames using source image with batch processing.
+        
+        Args:
+            source_img: Source identity image
+            video_path: Path to driving video
+            max_frames: Optional limit on number of frames to process
+            batch_size: Number of frames to process simultaneously
+            
+        Returns:
+            Tuple of (generated frames, driving frames)
+        """
+        import time
+        
+        # Get video frames
+        cap = cv2.VideoCapture(video_path)
+        driving_frames = []
+        
+        while True:
+            ret, frame = cap.read()
+            if not ret or (max_frames and len(driving_frames) >= max_frames):
+                break
+                
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frame_pil = to_512(Image.fromarray(frame_rgb))
+            driving_frames.append(frame_pil)
+            
+        cap.release()
+        
+        print(f"Total frames to process: {len(driving_frames)}")
+        
+        # Process first frame to initialize source
+        start_time = time.time()
+        results = self.forward(
+            source_image=source_img,
+            driver_image=driving_frames[0],
+            crop=False,
+            smooth_pose=False, 
+            target_theta=True,
+            mix=True,
+            mix_old=False,
+            modnet_mask=False
+        )
+        
+        generated_frames = []
+        if results:
+            generated_frames.append(results[0][0])
+        
+        # Process remaining frames in batches with FPS tracking
+        frame_times = []
+        remaining_frames = driving_frames[1:]
+        
+        for i in range(0, len(remaining_frames), batch_size):
+            batch_start = time.time()
+            
+            # Get current batch
+            batch_frames = remaining_frames[i:i + batch_size]
+            
+            # Forward pass with batch
+            results = self.forward(
+                source_image=None,  # Source already processed
+                driver_image=batch_frames,  # Pass batch of frames
+                crop=False,
+                smooth_pose=False,
+                target_theta=True, 
+                mix=True,
+                mix_old=False,
+                modnet_mask=False
+            )
+            
+            if results:
+                generated_frames.extend(results[0])  # Extend with batch results
+            
+            batch_end = time.time()
+            batch_time = batch_end - batch_start
+            frame_times.append(batch_time / len(batch_frames))  # Per-frame time
+            
+            # Calculate and display running statistics
+            frames_processed = i + len(batch_frames)
+            if frames_processed % (batch_size * 2) == 0:  # Update every few batches
+                avg_fps = 1.0 / (sum(frame_times) / len(frame_times))
+                eta = (len(remaining_frames) - frames_processed) * (sum(frame_times) / len(frame_times))
+                print(f"Processed {frames_processed}/{len(driving_frames)} frames | "
+                    f"Average FPS: {avg_fps:.2f} | "
+                    f"ETA: {eta:.2f}s | "
+                    f"Batch time: {batch_time:.3f}s")
+        
+        # Final statistics
+        total_time = time.time() - start_time
+        avg_fps = len(driving_frames) / total_time
+        print(f"\nGeneration complete:")
+        print(f"Total frames: {len(driving_frames)}")
+        print(f"Total time: {total_time:.2f}s")
+        print(f"Average FPS: {avg_fps:.2f}")
+        print(f"Average time per frame: {1000 * total_time / len(driving_frames):.2f}ms")
+        print(f"Average time per batch: {1000 * total_time * batch_size / len(driving_frames):.2f}ms")
+        
+        return generated_frames, driving_frames
     def save_video(self,
             source_img: PIL.Image.Image,
             generated_frames: List[PIL.Image.Image], 
@@ -863,19 +967,30 @@ class InferenceWrapper(nn.Module):
         source_img_rgb = source_img.convert('RGB')
         source_array = np.array(source_img_rgb.resize(size))
         
-        for gen_frame, drive_frame in zip(generated_frames, driving_frames):
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(output_path, fourcc, fps, size)
+        
+        for gen_frame in generated_frames:
             # Ensure RGB format and resize
             gen_frame_rgb = gen_frame.convert('RGB')
-            drive_frame_rgb = drive_frame.convert('RGB')
-            
             gen_array = np.array(gen_frame_rgb.resize(size))
-            drive_array = np.array(drive_frame_rgb.resize(size))
+        
+        # Convert to BGR for OpenCV
+        out.write(cv2.cvtColor(gen_array, cv2.COLOR_RGB2BGR))
+
+        # for gen_frame, drive_frame in zip(generated_frames, driving_frames):
+        #     # Ensure RGB format and resize
+        #     gen_frame_rgb = gen_frame.convert('RGB')
+        #     drive_frame_rgb = drive_frame.convert('RGB')
             
-            # Concatenate frames
-            composite = np.concatenate([source_array, drive_array, gen_array], axis=1)
-            out.write(cv2.cvtColor(composite, cv2.COLOR_RGB2BGR))
+        #     gen_array = np.array(gen_frame_rgb.resize(size))
+        #     drive_array = np.array(drive_frame_rgb.resize(size))
             
-        out.release()
+        #     # Concatenate frames
+        #     composite = np.concatenate([source_array, drive_array, gen_array], axis=1)
+        #     out.write(cv2.cvtColor(composite, cv2.COLOR_RGB2BGR))
+            
+        # out.release()
 
         
 from typing import Optional, List, Dict, Union
